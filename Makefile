@@ -59,7 +59,7 @@ clean-doc:
 	#nbstripout docs/*.ipynb
 
 lint: ## check style with flake8
-	flake8 emulate tests
+	flake8 specsimile tests
 
 test: ## run tests quickly with the default Python
 	PYTHONPATH=. pytest
@@ -68,13 +68,13 @@ test-all: ## run tests on every Python version with tox
 	tox
 
 coverage: ## check code coverage quickly with the default Python
-	coverage run --source emulate -m pytest
+	coverage run --source specsimile -m pytest
 	coverage report -m
 	coverage html
 	$(BROWSER) htmlcov/index.html
 
 docs: ## generate Sphinx HTML documentation, including API docs
-	rm -f docs/emulate.rst
+	rm -f docs/specsimile.rst
 	rm -f docs/modules.rst
 	#nbstripout docs/*.ipynb
 	sphinx-apidoc -H API -o docs/ . setup.py autosampler.py
@@ -86,7 +86,7 @@ servedocs: docs ## compile the docs watching for changes
 	watchmedo shell-command -p '*.rst' -c '$(MAKE) -C docs html' -R -D .
 
 release: dist ## package and upload a release
-	twine upload -s dist/*.tar.gz
+	twine upload --verbose dist/*.tar.gz
 
 dist: clean ## builds source and wheel package
 	$(PYTHON) setup.py sdist
