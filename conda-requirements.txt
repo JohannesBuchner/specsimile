@@ -1,0 +1,4 @@
+oldest-supported-numpy
+torch
+h5py
+matplotlib

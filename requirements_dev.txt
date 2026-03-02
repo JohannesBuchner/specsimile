@@ -1,0 +1,8 @@
+numpy
+torch
+h5py
+matplotlib
+corner
+flake8
+coveralls
+pytest-html
