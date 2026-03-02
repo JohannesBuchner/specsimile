@@ -169,48 +169,28 @@ class DatasetReader:
     Read emulator training dataset from HDF5.
     """
 
-    def __init__(self, filename: str, mode: str = "r"):
-        self.filename = str(filename)
-        if not os.path.exists(self.filename) and "r" in mode:
-            raise FileNotFoundError(self.filename)
+    def __init__(self, filename: str, mode: str = "r", xlabel=None, ylabel=None, xunit=None, yunit=None):
+        if not os.path.exists(filename):
+            raise FileNotFoundError(filename)
+        self.filename = filename
         self._f = h5py.File(self.filename, mode=mode)
+        self.xlabel = xlabel or str(self._f.attrs.get("xlabel", ""))
+        self.ylabel = ylabel or str(self._f.attrs.get("ylabel", ""))
+        self.xunit = xunit or str(self._f.attrs.get("xunit", ""))
+        self.yunit = yunit or str(self._f.attrs.get("yunit", ""))
+        self.params = self._f["params"][()].astype(np.float64)
+        self.paramnames = _as_str_list(self._f["paramnames"][()])
+        self.x = self._f["x"][()].astype(np.float64)
+        self.y = self._f["y"][()].astype(np.float64)
+
+    def __str__(self) -> str:
+        return f'''Dataset(filename={self.filename},
+xlabel={self.xlabel}, x={self.x.min()}..{self.x.max()}, xunit={self.xunit},
+ylabel={self.ylabel}, y={self.y.min()}..{self.y.max()}, yunit={self.yunit},
+)'''
 
     def __len__(self) -> int:
-        return int(self._f["y"].shape[0])
-
-    @property
-    def xlabel(self) -> str:
-        return str(self._f.attrs.get("xlabel", ""))
-
-    @property
-    def ylabel(self) -> str:
-        return str(self._f.attrs.get("ylabel", ""))
-
-    @property
-    def xunit(self) -> str:
-        return str(self._f.attrs.get("xunit", ""))
-
-    @property
-    def yunit(self) -> str:
-        return str(self._f.attrs.get("yunit", ""))
-
-    @property
-    def paramnames(self):
-        if "paramnames" not in self._f:
-            return None
-        return _as_str_list(self._f["paramnames"][()])
-
-    @property
-    def x(self) -> np.ndarray:
-        return self._f["x"][()].astype(np.float64)
-
-    @property
-    def y(self) -> np.ndarray:
-        return self._f["y"][()].astype(np.float64)
-
-    @property
-    def params(self) -> np.ndarray:
-        return self._f["params"][()].astype(np.float64)
+        return int(self.y.shape[0])
 
     def close(self):
         if self._f is not None:

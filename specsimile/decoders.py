@@ -200,7 +200,7 @@ class SBPLDecoder(nn.Module, _XSetterMixin):
         self,
         x,
         *,
-        x0,
+        x0=None,
         slope_scale=2.5,
         logx_pad=1.0,
         logwidth_lo=-1.0,
@@ -209,7 +209,8 @@ class SBPLDecoder(nn.Module, _XSetterMixin):
     ):
         super().__init__()
         self._set_x(x)
-        self.register_buffer("_x0", torch.tensor(float(x0), dtype=torch.float64))
+        if x0 is not None:
+            self.register_buffer("_x0", torch.tensor(float(x0), dtype=torch.float64))
         self.slope_scale = float(slope_scale)
         self.logx_pad = float(logx_pad)
         self.logwidth_lo = float(logwidth_lo)
@@ -219,7 +220,7 @@ class SBPLDecoder(nn.Module, _XSetterMixin):
 
     @property
     def x0(self):
-        return self._x0
+        return getattr(self, '_x0', None)
 
     def normalize(self, y: np.ndarray, params: np.ndarray) -> dict:
         y = np.asarray(y, np.float64)
@@ -266,23 +267,29 @@ class SBPLDecoder(nn.Module, _XSetterMixin):
         lognorm, s1, s2, xbrk, width = self.latent_to_params(z_phys)
 
         x = torch.clamp(self.x[None, :], min=1e-300)
-        x0 = torch.clamp(self.x0, min=1e-300)
 
         # SBPL-like smooth transition in log space
         q = torch.log(x / xbrk[:, None]) / width[:, None]
-        qpiv = torch.log(x0 / xbrk) / width
         q = torch.clamp(q, -50.0, 50.0)
-        qpiv = torch.clamp(qpiv, -50.0, 50.0)
+        if self.x0 is not None:
+            x0 = torch.clamp(self.x0, min=1e-300)
+            qpiv = torch.log(x0 / xbrk) / width
+            qpiv = torch.clamp(qpiv, -50.0, 50.0)
+            den = torch.exp(qpiv[:, None]) + torch.exp(-qpiv[:, None])
+            xrel = x / x0
+        else:
+            den = 1 + 1
+            x0 = xbrk[:, None]
+            xrel = x / x0
 
         num = torch.exp(q) + torch.exp(-q)
-        den = torch.exp(qpiv[:, None]) + torch.exp(-qpiv[:, None])
         ratio = num / (den + 1e-30)
 
         expo = ((s2 - s1) / 2.0)[:, None] * width[:, None]
         expo = torch.clamp(expo, -10.0, 10.0)
 
         norm = torch.pow(10.0, lognorm)
-        y = norm[:, None] * (x / x0) ** (((s1 + s2 + 2.0) / 2.0)[:, None]) * (ratio ** expo) * (x0 / x)
+        y = norm[:, None] * xrel ** (((s1 + s2 + 2.0) / 2.0)[:, None]) * (ratio ** expo) * xrel
         y = torch.clamp(y, min=self.eps)
         return torch.log10(y)
 
@@ -309,13 +316,14 @@ class QuadraticDecoder(nn.Module, _XSetterMixin):
     """
     paramnames = ["logA", "x_peak", "w"]
 
-    def __init__(self, x, *, logw_lo=-1.0, logw_hi=1.0, eps=1e-30):
+    def __init__(self, x, *, logw_lo=-1.0, logw_hi=1.0, logx_pad=1, eps=1e-30):
         super().__init__()
         self._set_x(x)
         self.logw_lo = float(logw_lo)
         self.logw_hi = float(logw_hi)
         self.eps = float(eps)
         self.latent_dim = 3
+        self.logx_pad = float(logx_pad)
 
     def normalize(self, y: np.ndarray, params: np.ndarray) -> dict:
         y = np.asarray(y, np.float64)
@@ -346,8 +354,8 @@ class QuadraticDecoder(nn.Module, _XSetterMixin):
         logA = z_phys[:, 0]
 
         x = self.x
-        logx_lo = float(np.log10(x.min().item()))
-        logx_hi = float(np.log10(x.max().item()))
+        logx_lo = float(np.log10(x.min().item())) - self.logx_pad
+        logx_hi = float(np.log10(x.max().item())) + self.logx_pad
         logxpeak = sigmoid_asinh(z_phys[:, 1], logx_lo, logx_hi)
         xpeak = torch.pow(10.0, logxpeak)
 

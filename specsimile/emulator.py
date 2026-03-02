@@ -24,7 +24,7 @@ class MLP(nn.Module):
 
 
 class Emulator:
-    def __init__(self, model_path: str, decoder, shape: list[int], *, device=None):
+    def __init__(self, model_path: str, decoder, shape: list[int], *, device=None, dynamic_range=None, func_floor_loss=None):
         self.model_path = str(model_path)
         self.decoder = decoder
         self.shape = list(shape)
@@ -38,6 +38,8 @@ class Emulator:
         self.fit_mean: float | None = None
         self.fit_median: float | None = None
         self.fit_p95: float | None = None
+        self.dynamic_range = dynamic_range
+        self.func_floor_loss = func_floor_loss
 
     # ---------- helpers ----------
     def _y_mean_std(self, norm: dict, y_dim: int):
@@ -118,6 +120,67 @@ class Emulator:
 
         return f"[P:{in_dim}]-[MLP:{enc_str}]->[latent:{latent_dim}]-{dec_name}-[y:{ydim}]"
 
+    def _apply_dynamic_range_torch(self, yhat: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Apply dynamic-range clamping in the *same space* as yhat,y (y_pre space).
+        """
+        if self.dynamic_range is None:
+            return yhat, y
+
+        dr = float(self.dynamic_range)
+        ymax = torch.max(y, dim=1, keepdim=True).values  # (B,1)
+
+        # global minimum allowed ymax (in y_pre / standardized-target space)
+        min_ymax = ymax - dr
+        if self.func_floor_loss is not None:
+            min_ymax = torch.clamp(ymax, min=self.func_floor_loss)
+        #print(f"replacing ymax={ymax.min()} with {min_ymax}")
+        ymax = torch.maximum(ymax, min_ymax)
+
+        floor = ymax - dr
+        return torch.clamp(yhat, min=floor), torch.clamp(y, min=floor)
+
+    def _apply_dynamic_range_np(self, yhat: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Apply dynamic-range clamping in y_pre space (numpy).
+        """
+        if self.dynamic_range is None:
+            return yhat, y
+        dr = float(self.dynamic_range)
+        ymax = np.max(y, axis=1, keepdims=True)
+
+        min_ymax = ymax - dr
+        #print(f"replacing ymax={ymax.min()} with {min_ymax}")
+        ymax = np.maximum(ymax, min_ymax)
+        if self.func_floor_loss is not None:
+            min_ymax = np.maximum(ymax, self.func_floor_loss)
+
+        floor = ymax - dr
+        return np.maximum(yhat, floor), np.maximum(y, floor)
+
+    def rms_per_sample_torch(self, yhat: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """
+        Returns (B,) RMS in y_pre space, with dynamic-range clamp applied if configured.
+        """
+        yhat2, y2 = self._apply_dynamic_range_torch(yhat, y)
+        return torch.sqrt(torch.mean((yhat2 - y2) ** 2, dim=1))
+
+    def rms_per_sample_np(self, yhat: np.ndarray, y: np.ndarray) -> np.ndarray:
+        """
+        Returns (N,) RMS in y_pre space, with dynamic-range clamp applied if configured.
+        """
+        yhat2, y2 = self._apply_dynamic_range_np(np.asarray(yhat), np.asarray(y))
+        return np.sqrt(np.mean((yhat2 - y2) ** 2, axis=1))
+
+    def loss_fn(self, yhat: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """
+        yhat, y: (B, D) in the *training target space* (usually log10(y) or y_pre).
+        dynamic_range:
+          - if None: plain MSE
+          - else: clamp both yhat and y to at least (per-sample max - dynamic_range)
+        """
+        return self.rms_per_sample_torch(yhat, y).mean()
+
     # ---------- training ----------
     def fit(
         self,
@@ -179,9 +242,6 @@ class Emulator:
         y_mean = torch.tensor(y_mean_np.reshape(1, -1), dtype=torch.float64, device=self.device)
         y_std = torch.tensor(y_std_np.reshape(1, -1), dtype=torch.float64, device=self.device)
 
-        def rms_loss(yhat, ytrue):
-            return torch.sqrt(torch.mean((yhat - ytrue) ** 2, dim=1)).mean()
-
         best = np.inf
         best_state = None
         bad = 0
@@ -199,7 +259,7 @@ class Emulator:
                 y_pre = dec(z_phys)
                 y_hat = (y_pre - y_mean) / y_std
 
-                loss = rms_loss(y_hat, tb)
+                loss = self.loss_fn(y_hat, tb)
                 opt.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(enc.parameters(), 1.0)
@@ -211,7 +271,7 @@ class Emulator:
                 z_phys = z_norm * lat_std + lat_mean
                 y_pre = dec(z_phys)
                 y_hat = (y_pre - y_mean) / y_std
-                vloss = rms_loss(y_hat, Tva).item()
+                vloss = self.loss_fn(y_hat, Tva).item()
 
             if vloss < best - 1e-4:
                 best = vloss
@@ -241,7 +301,7 @@ class Emulator:
             np.log10(np.clip(Y[va_idx], float(norm_info["y"].get("eps", 1e-30)), None))
             if bool(norm_info["y"].get("log", False)) else Y[va_idx]
         )
-        err = np.sqrt(np.mean((y_pre_hat - y_pre_true) ** 2, axis=1))
+        err = self.rms_per_sample_np(y_pre_hat, y_pre_true)
 
         self.fit_mean = float(np.mean(err))
         self.fit_median = float(np.percentile(err, 50))
@@ -269,8 +329,8 @@ class Emulator:
 
     # ---------- inference ----------
     def transform(self, params, *, x=None, dataset: DatasetReader | None = None, return_latent_params=True):
-        if dataset is None:
-            raise ValueError("dataset must be provided (needed for x-grid and consistent decoder usage)")
+        if dataset is None and x is None:
+            raise ValueError("dataset or x must be provided")
 
         # set decoder x from dataset unless user overrides x
         grid = dataset.x if x is None else np.asarray(x, dtype=np.float64)
@@ -347,7 +407,7 @@ class Emulator:
             np.log10(np.clip(Y, float(norm["y"].get("eps", 1e-30)), None))
             if bool(norm["y"].get("log", False)) else Y
         )
-        err = np.sqrt(np.mean((y_pre_hat - y_pre_true) ** 2, axis=1))
+        err = self.rms_per_sample_np(y_pre_hat, y_pre_true)
         yhat = (10.0 ** y_pre_hat) if bool(norm["y"].get("log", False)) else y_pre_hat
 
         dec_params = None
