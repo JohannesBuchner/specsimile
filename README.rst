@@ -1,6 +1,6 @@
-=======
+==========
 specsimile
-=======
+==========
 
 Neural network emulator for spectral models in physics.
 
