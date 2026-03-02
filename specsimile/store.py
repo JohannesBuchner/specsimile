@@ -175,13 +175,8 @@ class DatasetReader:
             raise FileNotFoundError(self.filename)
         self._f = h5py.File(self.filename, mode=mode)
 
-    @property
-    def N(self) -> int:
-        return int(self._f.attrs.get("N", self._f["y"].shape[0]))
-
-    @property
-    def num_data_training(self) -> int:
-        return int(self._f.attrs.get("num_data_training", self._f["y"].shape[0]))
+    def __len__(self) -> int:
+        return int(self._f["y"].shape[0])
 
     @property
     def xlabel(self) -> str:

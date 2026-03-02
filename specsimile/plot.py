@@ -15,7 +15,6 @@ def plot_error_hist(emu, eval_out, bins=50, logx=True):
     ax.hist(e, bins=bins, color="0.6", edgecolor="0.2")
     p95 = np.percentile(e, 95)
     mean_rms = np.mean(e)
-    ax.axvline(emu.tolerance, color="C2", lw=2, ls="--", label=f"tolerance={emu.tolerance:.3g}")
     ax.axvline(mean_rms, color="C4", lw=2, ls="--", label=f"mean={mean_rms:.3g}")
     ax.axvline(p95, color="C3", lw=2, label=f"p95={p95:.3g}")
     ax.set_xlabel("RMS error (tolerance space)")
@@ -97,8 +96,6 @@ def plot_param_corner_scatter(emu, eval_out, param_names=None, max_points=5000):
 
     fig, axes = plt.subplots(D, D, figsize=(2.1 * D, 2.1 * D), squeeze=False)
 
-    if param_names is None:
-        param_names = getattr(emu, "paramnames", None)
     if param_names is None or len(param_names) != D:
         param_names = [f"p{i}" for i in range(D)]
 
