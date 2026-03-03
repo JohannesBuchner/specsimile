@@ -107,3 +107,5 @@ ENV/
 *.pdf
 *.log
 *.npz
+
+README.html
