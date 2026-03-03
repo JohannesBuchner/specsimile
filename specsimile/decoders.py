@@ -118,8 +118,8 @@ class CutoffPLDecoder(nn.Module, _XSetterMixin):
 
     def __init__(
         self,
-        x,
         *,
+        x=None,
         gamma_lo=0.5,
         gamma_hi=6.0,
         xcut_lo=1e-3,
@@ -127,7 +127,8 @@ class CutoffPLDecoder(nn.Module, _XSetterMixin):
         eps=1e-30,
     ):
         super().__init__()
-        self._set_x(x)
+        if x is not None:
+            self._set_x(x)
         self.eps = float(eps)
         self.latent_dim = 3
 
@@ -198,8 +199,8 @@ class SBPLDecoder(nn.Module, _XSetterMixin):
 
     def __init__(
         self,
-        x,
         *,
+        x=None,
         x0=None,
         slope_scale=2.5,
         logx_pad=1.0,
@@ -208,7 +209,8 @@ class SBPLDecoder(nn.Module, _XSetterMixin):
         eps=1e-30,
     ):
         super().__init__()
-        self._set_x(x)
+        if x is not None:
+            self._set_x(x)
         if x0 is not None:
             self.register_buffer("_x0", torch.tensor(float(x0), dtype=torch.float64))
         self.slope_scale = float(slope_scale)
@@ -314,11 +316,12 @@ class QuadraticDecoder(nn.Module, _XSetterMixin):
 
     This is the generic replacement for your torus log-quadratic (single component).
     """
-    paramnames = ["logA", "x_peak", "w"]
+    paramnames = ["logA", "x_peak", "sigma"]
 
-    def __init__(self, x, *, logw_lo=-1.0, logw_hi=1.0, logx_pad=1, eps=1e-30):
+    def __init__(self, x=None, *, logw_lo=-1.0, logw_hi=1.0, logx_pad=1, eps=1e-30):
         super().__init__()
-        self._set_x(x)
+        if x is not None:
+            self._set_x(x)
         self.logw_lo = float(logw_lo)
         self.logw_hi = float(logw_hi)
         self.eps = float(eps)
