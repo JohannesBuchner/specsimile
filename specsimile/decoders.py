@@ -56,10 +56,10 @@ class DenseDecoder(nn.Module):
             raise ValueError("y must be (N,Y), params must be (N,P) with same N")
 
         return {
-            "y": {"log": False, "mean": y.mean(axis=0), "std": y.std(axis=0) + 1e-12, "eps": 1e-30},
+            "y": {"log": False, "eps": 1e-30},
             "params": {"log_mask": np.zeros(params.shape[1], bool), "mean": params.mean(axis=0), "std": params.std(axis=0) + 1e-12, "eps": 1e-30},
             "latent_dim": self.latent_dim,
-            "latent": {"mean": np.zeros(self.latent_dim), "std": np.ones(self.latent_dim), "log_mask": np.zeros(self.latent_dim, bool)},
+            "latent": {"mean": y.mean(axis=0), "std": y.std(axis=0) + 1e-12, "log_mask": np.zeros(self.latent_dim, bool)},
         }
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
@@ -88,10 +88,10 @@ class LogDenseDecoder(nn.Module):
 
         ylog = np.log10(np.clip(y, self.eps, None))
         return {
-            "y": {"log": True, "mean": ylog.mean(axis=0), "std": ylog.std(axis=0) + 1e-12, "eps": self.eps},
+            "y": {"log": True, "eps": self.eps},
             "params": {"log_mask": np.zeros(params.shape[1], bool), "mean": params.mean(axis=0), "std": params.std(axis=0) + 1e-12, "eps": 1e-30},
             "latent_dim": self.latent_dim,
-            "latent": {"mean": np.zeros(self.latent_dim), "std": np.ones(self.latent_dim), "log_mask": np.zeros(self.latent_dim, bool)},
+            "latent": {"mean": ylog.mean(axis=0), "std": ylog.std(axis=0) + 1e-12, "log_mask": np.zeros(self.latent_dim, bool)},
         }
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
