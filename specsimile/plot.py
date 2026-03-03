@@ -73,6 +73,65 @@ def plot_fit_examples(eval_out, n_first=12, n_worst=12, yscale="log"):
     fig.tight_layout()
     return fig, axes
 
+def plot_fit_diff(eval_out, yscale="log", min_ratio=1.0, min_diff=0.0):
+    x = eval_out["x"]
+    y = eval_out["y_true"]
+    yhat = eval_out["yhat"]
+    err = eval_out['err']
+
+    ncol = len(x)
+
+    fig, axes = plt.subplots(2, ncol, figsize=(3.2 * ncol, 6.0), squeeze=False)
+
+    for i in range(ncol):
+        ylabel = f"{eval_out['ylabel']} [{i+1}]"
+        if eval_out['yunit'] != '':
+            ylabel += f" [{eval_out['yunit']}]"
+
+        ax = axes[0, i]
+        axdiff = axes[1, i]
+        yt = y[:,i]
+        yp = yhat[:,i]
+        ylo = min(yt.min(), yp.min())
+        yhi = max(yt.max(), yp.max())
+        if yscale == "log":
+            ax.scatter(np.clip(yt, 1e-300, None), np.clip(yp, 1e-300, None), c=err)
+            axdiff.scatter(np.clip(yt, 1e-300, None), np.clip(yp, 1e-300, None) / np.clip(yt, 1e-300, None), c=err)
+            ax.set_yscale('log')
+            ax.set_xscale('log')
+            axdiff.set_yscale('log')
+            axdiff.set_xscale('log')
+        else:
+            ax.scatter(yt, yp, c=err)
+            axdiff.scatter(yt, yp - yt, c=err)
+        ax.set_xlabel(f"true {ylabel} [{i+1}]")
+        ax.set_ylabel(f"pred {ylabel} [{i+1}]")
+        ax.set_ylim(ylo, yhi)
+        ax.set_xlim(ylo, yhi)
+        ax.plot([ylo, yhi], [ylo, yhi], '--', color='k')
+        ax.grid(True, which="both", alpha=0.2)
+
+        axdiff.set_xlabel(f"true {ylabel}")
+        if yscale == "log":
+            axdiff.set_ylabel(f"pred / true")
+        else:
+            axdiff.set_ylabel(f"pred - true")
+        ydifflo, ydiffhi = axdiff.get_ylim()
+        axdiff.set_xlim(ylo, yhi)
+        print('ydiff lims:', ydifflo, ydiffhi)
+        if yscale == "log":
+            ydiffhi = max(1. / ydifflo, ydiffhi, min_ratio)
+            axdiff.set_ylim(1. / ydiffhi, ydiffhi)
+            axdiff.plot([ylo, yhi], [1., 1.], '--', color='k')
+        else:
+            ydiffhi = max(abs(ydifflo), ydiffhi, min_diff)
+            axdiff.set_ylim(-ydiffhi, ydiffhi)
+            axdiff.plot([ylo, yhi], [0, 0], '--', color='k')
+        #axdiff.grid(True, which="both", alpha=0.2)
+
+    fig.tight_layout()
+    return fig, axes
+
 
 def plot_param_corner_scatter(eval_out, param_names=None, max_points=5000):
     P = np.asarray(eval_out["params"], float)
