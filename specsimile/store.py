@@ -62,10 +62,8 @@ class DatasetWriter:
         filename: str,
         N: int,
         x,
-        y,
-        params,
+        paramnames,
         *,
-        paramnames=None,
         xlabel: str = "",
         ylabel: str = "",
         xunit=None,
@@ -73,21 +71,16 @@ class DatasetWriter:
         mode: str = "w",
     ):
         self.filename = str(filename)
-        self._f = h5py.File(self.filename, mode=mode)
+        self._f = h5py.File(self.filename + ".tmp", mode=mode)
 
         N = int(N)
         x = np.asarray(x, dtype=np.float64)
-        y = np.asarray(y, dtype=np.float64)
-        params = np.asarray(params, dtype=np.float64)
+        num_params = len(paramnames)
 
         if x.ndim != 1:
             raise ValueError(f"x must be 1D, got {x.shape}")
-        if y.ndim != 1:
-            raise ValueError(f"y must be 1D, got {y.shape}")
-        if params.ndim != 1:
-            raise ValueError(f"params must be 1D, got {params.shape}")
 
-        for key in ("x", "y", "params"):
+        for key in ("x", "params"):
             if key in self._f:
                 raise RuntimeError(f"Dataset '{key}' already exists in {self.filename}")
 
@@ -95,11 +88,9 @@ class DatasetWriter:
         self.num_data_training = 0
 
         self._f.create_dataset("x", data=x)
-        self._f.create_dataset("y", dtype=np.float64, shape=(N, len(y)))
-        self._f.create_dataset("params", dtype=np.float64, shape=(N, len(params)))
+        self._f.create_dataset("y", dtype=np.float64, shape=(N, len(x)))
+        self._f.create_dataset("params", dtype=np.float64, shape=(N, num_params))
 
-        if paramnames is None:
-            paramnames = [f"p{i}" for i in range(len(params))]
         paramnames_b = _as_bytes_array(paramnames)
         self._f.create_dataset("paramnames", data=paramnames_b)
 
@@ -124,18 +115,18 @@ class DatasetWriter:
         if x.ndim != 1 or y.ndim != 1 or params.ndim != 1:
             raise ValueError("x,y,params must be 1D arrays")
 
-        if len(y) != self._f["y"].shape[1]:
-            raise ValueError("y length mismatch")
-        if len(params) != self._f["params"].shape[1]:
-            raise ValueError("params length mismatch")
-
         x0 = self._f["x"][()]
         if x.shape != x0.shape or not np.allclose(x, x0, rtol=0, atol=0):
             raise ValueError("x does not match stored x grid")
 
+        if len(y) != self._f["y"].shape[1]:
+            raise ValueError(f"y length mismatch, got {y[0]} but x.shape={self._f['x'].shape} and y.shape={self._f['y'].shape}")
+        if len(params) != self._f["params"].shape[1]:
+            raise ValueError(f"params length mismatch, got {y} but the {self._f['y'].shape[1]} parameters are {self._f['paramnames'][()]}")
+
         i = int(self.num_data_training)
         if i >= int(self.N):
-            raise RuntimeError(f"Training file full (N={self.N}).")
+            raise RuntimeError(f"Training file already completely filled (N={self.N}).")
 
         self._f["y"][i, :] = y
         self._f["params"][i, :] = params
@@ -153,7 +144,14 @@ class DatasetWriter:
     def close(self):
         if self._f is not None:
             try:
+                # remove any previous file if it exists, to not leave broken files
+                os.unlink(self.filename)
+            except IOError:
+                pass
+            try:
                 self._f.close()
+                # atomic write to final filename by move
+                os.rename(self.filename + ".tmp", self.filename)
             finally:
                 self._f = None
 
@@ -185,8 +183,8 @@ class DatasetReader:
 
     def __str__(self) -> str:
         return f'''Dataset(filename={self.filename},
-xlabel={self.xlabel}, x={self.x.min()}..{self.x.max()}, xunit={self.xunit},
-ylabel={self.ylabel}, y={self.y.min()}..{self.y.max()}, yunit={self.yunit},
+xlabel={self.xlabel}, xunit={self.xunit}, x={self.x.min()}..{self.x.max()},
+ylabel={self.ylabel}, yunit={self.yunit}, y={self.y.min()}..{self.y.max()},
 )'''
 
     def __len__(self) -> int:
