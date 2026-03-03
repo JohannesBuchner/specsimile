@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 import matplotlib as mpl
 
 
-def plot_error_hist(emu, eval_out, bins=50, logx=True):
+def plot_error_hist(eval_out, bins=50, logx=True):
     err = np.asarray(eval_out["err"], float)
     fig, ax = plt.subplots(figsize=(5.5, 3.5))
     e = err[np.isfinite(err)]
@@ -25,7 +25,7 @@ def plot_error_hist(emu, eval_out, bins=50, logx=True):
     return fig, ax
 
 
-def plot_fit_examples(emu, eval_out, n_first=12, n_worst=12, yscale="log"):
+def plot_fit_examples(eval_out, n_first=12, n_worst=12, yscale="log"):
     x = eval_out["x"]
     y = eval_out["y_true"]
     yhat = eval_out["yhat"]
@@ -74,7 +74,7 @@ def plot_fit_examples(emu, eval_out, n_first=12, n_worst=12, yscale="log"):
     return fig, axes
 
 
-def plot_param_corner_scatter(emu, eval_out, param_names=None, max_points=5000):
+def plot_param_corner_scatter(eval_out, param_names=None, max_points=5000):
     P = np.asarray(eval_out["params"], float)
     err = np.asarray(eval_out["err"], float)
     N, D = P.shape
@@ -128,7 +128,7 @@ def plot_param_corner_scatter(emu, eval_out, param_names=None, max_points=5000):
     return fig, axes
 
 
-def plot_decoder_param_corner_scatter(emu, eval_out, param_names=None, max_points=5000):
+def plot_decoder_param_corner_scatter(eval_out, param_names=None, max_points=5000):
     Q = eval_out.get("dec_params", None)
     if Q is None:
         raise RuntimeError("dec_params not available (decoder may not implement latent_to_params)")
