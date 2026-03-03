@@ -58,8 +58,14 @@ class Emulator:
 
     def _apply_latent_norm_inv(self, z_norm: np.ndarray, norm: dict) -> np.ndarray:
         lat = norm["latent"]
-        mean = np.asarray(lat["mean"], np.float64).reshape(1, -1)
-        std = np.asarray(lat["std"], np.float64).reshape(1, -1)
+        if 'std' in lat:
+            std = np.asarray(lat["std"], np.float64).reshape(1, -1)
+        else:
+            std = 1.0
+        if 'mean' in lat:
+            mean = np.asarray(lat["mean"], np.float64).reshape(1, -1)
+        else:
+            mean = 0.0
         return z_norm * std + mean
 
     def _target_y_pre(self, Y: np.ndarray, norm: dict) -> np.ndarray:
@@ -207,6 +213,8 @@ class Emulator:
             p.requires_grad_(False)
 
         norm_info = dec.normalize(Y, P)
+        for k, v in norm_info.items():
+            print("  Decoder normalisation:", k, v)
         latent_dim = int(norm_info.get("latent_dim", 0))
         if latent_dim <= 0:
             raise ValueError("decoder.normalize must return positive latent_dim")
@@ -235,8 +243,14 @@ class Emulator:
         opt = torch.optim.Adam(enc.parameters(), lr=lr)
 
         lat = norm_info["latent"]
-        lat_mean = torch.tensor(np.asarray(lat["mean"]).reshape(1, -1), dtype=torch.float64, device=self.device)
-        lat_std = torch.tensor(np.asarray(lat["std"]).reshape(1, -1), dtype=torch.float64, device=self.device)
+        if "mean" in lat:
+            lat_mean = torch.tensor(np.asarray(lat["mean"]).reshape(1, -1), dtype=torch.float64, device=self.device)
+        else:
+            lat_mean = 0.0
+        if "std" in lat:
+            lat_std = torch.tensor(np.asarray(lat["std"]).reshape(1, -1), dtype=torch.float64, device=self.device)
+        else:
+            lat_std = 1.0
 
         y_mean_np, y_std_np = self._y_mean_std(norm_info, Y.shape[1])
         y_mean = torch.tensor(y_mean_np.reshape(1, -1), dtype=torch.float64, device=self.device)
@@ -430,4 +444,8 @@ class Emulator:
             z_norm=z_norm,
             z_phys=z_phys,
             dec_params=dec_params,
+            xlabel=dataset.xlabel,
+            ylabel=dataset.ylabel,
+            xunit=dataset.xunit,
+            yunit=dataset.yunit,
         )
