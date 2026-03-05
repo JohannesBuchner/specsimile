@@ -40,6 +40,8 @@ class Emulator:
         self.fit_p95: float | None = None
         self.dynamic_range = dynamic_range
         self.func_floor_loss = func_floor_loss
+        self.train_param_bounds: dict | None = None
+        self.enforce_param_bounds: bool = True  # optional switch
 
     # ---------- helpers ----------
     def _y_mean_std(self, norm: dict, y_dim: int):
@@ -49,6 +51,25 @@ class Emulator:
         mean = np.zeros(y_dim, np.float64) if mean is None else np.asarray(mean, np.float64)
         std = np.ones(y_dim, np.float64) if std is None else np.asarray(std, np.float64)
         return mean, std
+
+    def _check_param_bounds(self, P: np.ndarray):
+        b = self.train_param_bounds
+        if b is None or not self.enforce_param_bounds:
+            return
+        pmin = np.asarray(b["min"], dtype=np.float64).reshape(1, -1)
+        pmax = np.asarray(b["max"], dtype=np.float64).reshape(1, -1)
+        if P.shape[1] != pmin.shape[1]:
+            raise ValueError("Parameter dimension mismatch vs stored bounds")
+
+        bad = np.any((P < pmin) | (P > pmax), axis=1)
+        if np.any(bad):
+            i = int(np.where(bad)[0][0])
+            raise ValueError(
+                f"Input params outside training bounds (first offending row {i}).\n"
+                f"params={P[i]}\n"
+                f"min={pmin[0]}\n"
+                f"max={pmax[0]}"
+            )
 
     def _apply_norm_params(self, P: np.ndarray, norm: dict) -> np.ndarray:
         pn = norm["params"]
@@ -83,9 +104,28 @@ class Emulator:
             raise FileNotFoundError(self.model_path)
 
         ckpt = torch.load(self.model_path, map_location="cpu")
+
         self._norm = ckpt["norm"]
         self._meta = ckpt.get("meta", {})
 
+        self.train_param_bounds = self._meta.get("train_param_bounds", None)
+        # validate decoder identity/config if present
+        dmeta = self._meta.get("decoder", None)
+        if dmeta is not None:
+            want_cls = dmeta.get("class_name")
+            got_cls = self.decoder.__class__.__name__
+            if want_cls is not None and want_cls != got_cls:
+                raise ValueError(f"Decoder class mismatch: ckpt has {want_cls}, but you provided {got_cls}")
+
+            want_cfg = dmeta.get("config", None)
+            if want_cfg is not None and hasattr(self.decoder, "get_config"):
+                got_cfg = self.decoder.get_config()
+                if got_cfg != want_cfg:
+                    raise ValueError(
+                        "Decoder config mismatch between checkpoint and provided decoder.\n"
+                        f"ckpt: {want_cfg}\n"
+                        f"got:  {got_cfg}"
+                    )
         self.fit_mean = ckpt.get("fit_mean", None)
         self.fit_median = ckpt.get("fit_median", None)
         self.fit_p95 = ckpt.get("fit_p95", None)
@@ -202,6 +242,8 @@ class Emulator:
     ) -> str:
         Y = dataset.y.astype(np.float64)
         P = dataset.params.astype(np.float64)
+        Pmin = P.min(axis=0)
+        Pmax = P.max(axis=0)
         x = dataset.x.astype(np.float64)
         utils.ensure_finite("P", P)
         utils.ensure_finite("Y", Y)
@@ -328,6 +370,12 @@ class Emulator:
             xunit=dataset.xunit,
             yunit=dataset.yunit,
             decoder_paramnames=getattr(self.decoder, "paramnames", None),
+            decoder=dict(
+                class_name=self.decoder.__class__.__name__,
+                module=self.decoder.__class__.__module__,
+                config=self.decoder.get_config() if hasattr(self.decoder, "get_config") else None,
+            ),
+            train_param_bounds=dict(min=Pmin.tolist(), max=Pmax.tolist())
         )
         fit_stats = dict(fit_mean=self.fit_mean, fit_median=self.fit_median, fit_p95=self.fit_p95)
 
@@ -343,12 +391,16 @@ class Emulator:
 
     # ---------- inference ----------
     def transform(self, params, *, x=None, dataset: DatasetReader | None = None, return_latent_params=True):
-        if dataset is None and x is None:
-            raise ValueError("dataset or x must be provided")
-
         # set decoder x from dataset unless user overrides x
-        grid = dataset.x if x is None else np.asarray(x, dtype=np.float64)
-        self.decoder.x = grid
+        if return_latent_params:
+            if x is not None:
+                raise ValueError("no x should be set when return_latent_params=True")
+            if dataset is not None:
+                raise ValueError("no dataset should be set when return_latent_params=True")
+        if x is not None:
+            self.decoder.x = np.asarray(x, dtype=np.float64)
+        elif dataset is not None:
+            self.decoder.x = dataset.x
         dec = self.decoder.to(self.device).double().eval()
         for p in dec.parameters():
             p.requires_grad_(False)
@@ -356,8 +408,10 @@ class Emulator:
         P, squeeze = utils.as_2d(params)
         utils.ensure_finite("params", P)
 
+        self._check_param_bounds(P)
         norm = self._norm
         Pn = self._apply_norm_params(P, norm)
+
         X = torch.tensor(Pn, dtype=torch.float64, device=self.device)
 
         with torch.no_grad():

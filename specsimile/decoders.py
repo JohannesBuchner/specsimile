@@ -1,5 +1,7 @@
 # specsimile/decoders.py
 #!/usr/bin/env python3
+import json
+import hashlib
 import numpy as np
 import torch
 import torch.nn as nn
@@ -39,15 +41,33 @@ class _XSetterMixin:
         self._set_x(value)
 
 
-class DenseDecoder(nn.Module):
-    """latent_dim = y_dim ; forward(z)=z."""
-    paramnames = None
+class DecoderConfigMixin:
+    """
+    Provide a JSON-serializable decoder config for checkpointing.
+    Only include init args that affect normalize() or latent_to_params().
+    Do NOT include x (grid) because x is dataset/user provided at inference.
+    """
+    def get_config(self) -> dict:
+        return {}
 
-    def __init__(self, y_dim: int):
+    def config_hash(self) -> str:
+        s = json.dumps(self.get_config(), sort_keys=True)
+        return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+class DenseDecoder(nn.Module, DecoderConfigMixin):
+    """latent_dim = y_dim ; forward(z)=z."""
+
+    def __init__(self, y_dim: int, paramnames = None):
         super().__init__()
         self.y_dim = int(y_dim)
         self.latent_dim = self.y_dim
-        self.paramnames = [f"y{i}" for i in range(self.y_dim)]
+        if paramnames is None:
+            self.paramnames = [f"y{i}" for i in range(self.y_dim)]
+        else:
+            self.paramnames = paramnames
+        if len(self.paramnames) != self.y_dim:
+            raise ValueError(f"paramnames={paramnames} must be same length as y_dim={y_dim}")
 
     def normalize(self, y: np.ndarray, params: np.ndarray) -> dict:
         y = np.asarray(y, dtype=np.float64)
@@ -68,17 +88,20 @@ class DenseDecoder(nn.Module):
     def latent_to_params(self, z: torch.Tensor) -> torch.Tensor:
         return z
 
+    def get_config(self) -> dict:
+        return dict(
+            y_dim=int(self.y_dim),
+            paramnames=list(self.paramnames),
+        )
 
-class LogDenseDecoder(nn.Module):
+class LogDenseDecoder(DenseDecoder):
     """latent_dim=y_dim ; forward(z)=z interpreted as log10(y)."""
-    paramnames = None
 
-    def __init__(self, y_dim: int, eps: float = 1e-30):
-        super().__init__()
-        self.y_dim = int(y_dim)
-        self.latent_dim = self.y_dim
+    def __init__(self, y_dim: int, eps: float = 1e-30, paramnames=None):
+        super().__init__(
+            y_dim=y_dim,
+            paramnames=paramnames or [f"logy{i}" for i in range(self.y_dim)])
         self.eps = float(eps)
-        self.paramnames = [f"logy{i}" for i in range(self.y_dim)]
 
     def normalize(self, y: np.ndarray, params: np.ndarray) -> dict:
         y = np.asarray(y, dtype=np.float64)
@@ -94,17 +117,16 @@ class LogDenseDecoder(nn.Module):
             "latent": {"mean": ylog.mean(axis=0), "std": ylog.std(axis=0) + 1e-12, "log_mask": np.zeros(self.latent_dim, bool)},
         }
 
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        return z
-
     def evaluate(self, z: torch.Tensor) -> torch.Tensor:
         return torch.pow(10.0, z)
 
-    def latent_to_params(self, z: torch.Tensor) -> torch.Tensor:
-        return z
+    def get_config(self) -> dict:
+        cfg = super().get_config()
+        cfg.update(dict(eps=float(self.eps)))
+        return cfg
 
 
-class CutoffPLDecoder(nn.Module, _XSetterMixin):
+class CutoffPLDecoder(nn.Module, _XSetterMixin, DecoderConfigMixin):
     """
     Generic cutoff power-law on x-grid:
       y(x) = A * x^{-gamma} * exp(-x/xcut)
@@ -180,8 +202,18 @@ class CutoffPLDecoder(nn.Module, _XSetterMixin):
     def evaluate(self, z_phys: torch.Tensor) -> torch.Tensor:
         return torch.pow(10.0, self.forward(z_phys))
 
+    def get_config(self) -> dict:
+        # store physical bounds (not log-bounds) to avoid ambiguity
+        return dict(
+            gamma_lo=float(self.gamma_lo),
+            gamma_hi=float(self.gamma_hi),
+            xcut_lo=float(10.0 ** self.logxcut_lo),
+            xcut_hi=float(10.0 ** self.logxcut_hi),
+            eps=float(self.eps),
+        )
 
-class SBPLDecoder(nn.Module, _XSetterMixin):
+
+class SBPLDecoder(nn.Module, _XSetterMixin, DecoderConfigMixin):
     """
     Generic smooth broken power law (SBPL) on x-grid, returning log10(y).
 
@@ -199,11 +231,12 @@ class SBPLDecoder(nn.Module, _XSetterMixin):
 
     def __init__(
         self,
+        logx_lo,
+        logx_hi,
         *,
         x=None,
         x0=None,
         slope_scale=2.5,
-        logx_pad=1.0,
         logwidth_lo=-1.0,
         logwidth_hi=2.0,
         eps=1e-30,
@@ -214,11 +247,12 @@ class SBPLDecoder(nn.Module, _XSetterMixin):
         if x0 is not None:
             self.register_buffer("_x0", torch.tensor(float(x0), dtype=torch.float64))
         self.slope_scale = float(slope_scale)
-        self.logx_pad = float(logx_pad)
         self.logwidth_lo = float(logwidth_lo)
         self.logwidth_hi = float(logwidth_hi)
         self.eps = float(eps)
         self.latent_dim = 5
+        self.logx_lo = float(logx_lo)
+        self.logx_hi = float(logx_hi)
 
     @property
     def x0(self):
@@ -254,10 +288,7 @@ class SBPLDecoder(nn.Module, _XSetterMixin):
         s1 = self.slope_scale * torch.asinh(z_phys[:, 1])
         s2 = self.slope_scale * torch.asinh(z_phys[:, 2])
 
-        x = self.x
-        logx_lo = float(np.log10(x.min().item()))
-        logx_hi = float(np.log10(x.max().item()))
-        logxbrk = sigmoid_asinh(z_phys[:, 3], logx_lo - self.logx_pad, logx_hi + self.logx_pad)
+        logxbrk = sigmoid_asinh(z_phys[:, 3], self.logx_lo, self.logx_hi)
         xbrk = torch.pow(10.0, logxbrk)
 
         logw = sigmoid_asinh(z_phys[:, 4], self.logwidth_lo, self.logwidth_hi)
@@ -298,27 +329,37 @@ class SBPLDecoder(nn.Module, _XSetterMixin):
     def evaluate(self, z_phys: torch.Tensor) -> torch.Tensor:
         return torch.pow(10.0, self.forward(z_phys))
 
+    def get_config(self) -> dict:
+        return dict(
+            logx_lo=float(self.logx_lo),
+            logx_hi=float(self.logx_hi),
+            slope_scale=float(self.slope_scale),
+            logwidth_lo=float(self.logwidth_lo),
+            logwidth_hi=float(self.logwidth_hi),
+            x0=None if self.x0 is None else float(self.x0.detach().cpu().item()),
+            eps=float(self.eps),
+        )
 
-class QuadraticDecoder(nn.Module, _XSetterMixin):
+class QuadraticDecoder(nn.Module, _XSetterMixin, DecoderConfigMixin):
     """
     Single quadratic (in log10 x) peak shape, returning log10(y).
 
     Model:
       t = log10(x / x_peak)
-      log10(y) = logA - (t / w)**2
+      ln(y) = logA - (t / w)**2
 
     Physical latent:
       z_phys = [logA, logxpeak_raw, logw_raw]
 
     logxpeak is squashed to [log10(xmin), log10(xmax)]
     logw squashed to [logw_lo, logw_hi]
-    Normalization is at the peak by construction: y(x_peak)=10**logA.
+    Normalization is at the peak by construction: y(x_peak)=exp(logA).
 
-    This is the generic replacement for your torus log-quadratic (single component).
+    This is the generic replacement for the GRAHSP torus ln-quadratic (single component).
     """
     paramnames = ["logA", "x_peak", "sigma"]
 
-    def __init__(self, x=None, *, logw_lo=-1.0, logw_hi=1.0, logx_pad=1, eps=1e-30):
+    def __init__(self, logx_lo, logx_hi, x=None, *, logw_lo=-1.0, logw_hi=1.0, eps=1e-30):
         super().__init__()
         if x is not None:
             self._set_x(x)
@@ -326,7 +367,8 @@ class QuadraticDecoder(nn.Module, _XSetterMixin):
         self.logw_hi = float(logw_hi)
         self.eps = float(eps)
         self.latent_dim = 3
-        self.logx_pad = float(logx_pad)
+        self.logx_lo = float(logx_lo)
+        self.logx_hi = float(logx_hi)
 
     def normalize(self, y: np.ndarray, params: np.ndarray) -> dict:
         y = np.asarray(y, np.float64)
@@ -356,10 +398,7 @@ class QuadraticDecoder(nn.Module, _XSetterMixin):
         z_phys = z_phys.to(torch.float64)
         logA = z_phys[:, 0]
 
-        x = self.x
-        logx_lo = float(np.log10(x.min().item())) - self.logx_pad
-        logx_hi = float(np.log10(x.max().item())) + self.logx_pad
-        logxpeak = sigmoid_asinh(z_phys[:, 1], logx_lo, logx_hi)
+        logxpeak = sigmoid_asinh(z_phys[:, 1], self.logx_lo, self.logx_hi)
         xpeak = torch.pow(10.0, logxpeak)
 
         logw = sigmoid_asinh(z_phys[:, 2], self.logw_lo, self.logw_hi)
@@ -375,4 +414,13 @@ class QuadraticDecoder(nn.Module, _XSetterMixin):
         return logy
 
     def evaluate(self, z_phys: torch.Tensor) -> torch.Tensor:
-        return torch.pow(10.0, self.forward(z_phys))
+        return torch.exp(self.forward(z_phys))
+
+    def get_config(self) -> dict:
+        return dict(
+            logx_lo=float(self.logx_lo),
+            logx_hi=float(self.logx_hi),
+            logw_lo=float(self.logw_lo),
+            logw_hi=float(self.logw_hi),
+            eps=float(self.eps),
+        )
