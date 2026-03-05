@@ -84,9 +84,12 @@ def plot_fit_diff(eval_out, yscale="log", min_ratio=1.0, min_diff=0.0):
     fig, axes = plt.subplots(2, ncol, figsize=(3.2 * ncol, 6.0), squeeze=False)
 
     for i in range(ncol):
-        ylabel = f"{eval_out['ylabel']} [{i+1}]"
-        if eval_out['yunit'] != '':
-            ylabel += f" [{eval_out['yunit']}]"
+        if len(eval_out.get("labels", [])) == ncol:
+            ylabel = eval_out["labels"][i]
+        else:
+            ylabel = f"{eval_out['ylabel']} [{i+1}]"
+            if eval_out['yunit'] != '':
+                ylabel += f" [{eval_out['yunit']}]"
 
         ax = axes[0, i]
         axdiff = axes[1, i]
@@ -104,8 +107,8 @@ def plot_fit_diff(eval_out, yscale="log", min_ratio=1.0, min_diff=0.0):
         else:
             ax.scatter(yt, yp, c=err)
             axdiff.scatter(yt, yp - yt, c=err)
-        ax.set_xlabel(f"true {ylabel} [{i+1}]")
-        ax.set_ylabel(f"pred {ylabel} [{i+1}]")
+        ax.set_xlabel(f"true {ylabel}")
+        ax.set_ylabel(f"pred {ylabel}")
         ax.set_ylim(ylo, yhi)
         ax.set_xlim(ylo, yhi)
         ax.plot([ylo, yhi], [ylo, yhi], '--', color='k')
