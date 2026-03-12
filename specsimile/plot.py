@@ -25,7 +25,7 @@ def plot_error_hist(eval_out, bins=50, logx=True):
     return fig, ax
 
 
-def plot_fit_examples(eval_out, n_first=12, n_worst=12, yscale="log"):
+def plot_fit_examples(eval_out, n_first=12, n_worst=12, yscale="log", legend=False):
     x = eval_out["x"]
     y = eval_out["y_true"]
     yhat = eval_out["yhat"]
@@ -59,6 +59,11 @@ def plot_fit_examples(eval_out, n_first=12, n_worst=12, yscale="log"):
 
         ax.set_title(f"i={i}  err={err[i]:.3g}", fontsize=9)
         ax.grid(True, which="both", alpha=0.2)
+        if legend:
+            ax.legend(title=f"""z_norm={" ".join(['%.2f' % v for v in eval_out["z_norm"][i]]  if eval_out.get("z_norm") is not None else '' )}
+z_phys={" ".join(['%.2f' % v for v in eval_out["z_phys"][i]])  if eval_out.get("z_phys") is not None else ''}
+params={" ".join(['%.2f' % v for v in eval_out["dec_params"][i]]) if eval_out.get("dec_params") is not None else '?'}
+""")
 
     for j, i in enumerate(idx_first[::2]):
         _plot(axes[0, j], i)
@@ -116,12 +121,10 @@ def plot_fit_diff(eval_out, yscale="log", min_ratio=1.0, min_diff=0.0):
 
         axdiff.set_xlabel(f"true {ylabel}")
         if yscale == "log":
-            axdiff.set_ylabel(f"pred / true")
+            axdiff.set_ylabel("pred / true")
         else:
-            axdiff.set_ylabel(f"pred - true")
+            axdiff.set_ylabel("pred - true")
         ydifflo, ydiffhi = axdiff.get_ylim()
-        axdiff.set_xlim(ylo, yhi)
-        print('ydiff lims:', ydifflo, ydiffhi)
         if yscale == "log":
             ydiffhi = max(1. / ydifflo, ydiffhi, min_ratio)
             axdiff.set_ylim(1. / ydiffhi, ydiffhi)
