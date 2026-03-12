@@ -305,15 +305,15 @@ class SBPLDecoder(nn.Module, _XSetterMixin, DecoderConfigMixin):
         q = torch.log(x / xbrk[:, None]) / width[:, None]
         q = torch.clamp(q, -50.0, 50.0)
         if self.x0 is not None:
+            # normalised the function with the normalisation at x0
             x0 = torch.clamp(self.x0, min=1e-300)
             qpiv = torch.log(x0 / xbrk) / width
             qpiv = torch.clamp(qpiv, -50.0, 50.0)
             den = torch.exp(qpiv[:, None]) + torch.exp(-qpiv[:, None])
-            xrel = x / x0
         else:
             den = 1 + 1
             x0 = xbrk[:, None]
-            xrel = x / x0
+        xrel = x / x0
 
         num = torch.exp(q) + torch.exp(-q)
         ratio = num / (den + 1e-30)
@@ -322,7 +322,7 @@ class SBPLDecoder(nn.Module, _XSetterMixin, DecoderConfigMixin):
         expo = torch.clamp(expo, -10.0, 10.0)
 
         norm = torch.pow(10.0, lognorm)
-        y = norm[:, None] * xrel ** (((s1 + s2 + 2.0) / 2.0)[:, None]) * (ratio ** expo) * xrel
+        y = norm[:, None] * xrel ** (((s1 + s2 + 2.0) / 2.0)[:, None]) * (ratio ** expo) / xrel
         y = torch.clamp(y, min=self.eps)
         return torch.log10(y)
 
@@ -414,7 +414,7 @@ class QuadraticDecoder(nn.Module, _XSetterMixin, DecoderConfigMixin):
         return logy
 
     def evaluate(self, z_phys: torch.Tensor) -> torch.Tensor:
-        return torch.exp(self.forward(z_phys))
+        return torch.pow(10, self.forward(z_phys))
 
     def get_config(self) -> dict:
         return dict(
