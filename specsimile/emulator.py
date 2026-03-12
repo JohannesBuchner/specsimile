@@ -3,10 +3,13 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
+#import torch.nn.functional as F
+#import math
 
 from . import utils
 from .store import DatasetReader
 
+LOGTHRESH = float(np.log10(3.0))
 
 class MLP(nn.Module):
     def __init__(self, nin: int, nout: int, shape: list[int]):
@@ -22,9 +25,21 @@ class MLP(nn.Module):
     def forward(self, x):
         return self.net(x)
 
+def softplus_np(z):
+    z = np.asarray(z, dtype=np.float64)
+    return np.log1p(np.exp(-np.abs(z))) + np.maximum(z, 0.0)
+
+def soft_floor_np(x, floor, k=10.0):
+    z = k * (x - floor)
+    return floor + softplus_np(z) / k
+
+def soft_floor_torch(x, floor, k=10.0):
+    # smooth approximation to max(x, floor)
+    return floor + torch.nn.functional.softplus(k * (x - floor))/k
+
 
 class Emulator:
-    def __init__(self, model_path: str, decoder, shape: list[int], *, device=None, dynamic_range=None, func_floor_loss=None):
+    def __init__(self, model_path: str, decoder, shape: list[int], *, device=None, dynamic_range=None, func_floor_loss=None, loss_y_weights=None, param_bounds_policy='error'):
         self.model_path = str(model_path)
         self.decoder = decoder
         self.shape = list(shape)
@@ -41,7 +56,14 @@ class Emulator:
         self.dynamic_range = dynamic_range
         self.func_floor_loss = func_floor_loss
         self.train_param_bounds: dict | None = None
-        self.enforce_param_bounds: bool = True  # optional switch
+        self.param_bounds_policy = param_bounds_policy
+        self.param_bounds_tol: float = 0.0
+        if loss_y_weights is None:
+            self.loss_y_weights = 1.
+        else:
+            self.loss_y_weights = torch.tensor(
+                loss_y_weights.reshape((1, -1)),
+                dtype=torch.float64, device=self.device)
 
     # ---------- helpers ----------
     def _y_mean_std(self, norm: dict, y_dim: int):
@@ -52,23 +74,42 @@ class Emulator:
         std = np.ones(y_dim, np.float64) if std is None else np.asarray(std, np.float64)
         return mean, std
 
-    def _check_param_bounds(self, P: np.ndarray):
+    def inside_param_bounds(self, P: np.ndarray):
         b = self.train_param_bounds
-        if b is None or not self.enforce_param_bounds:
+        if b is None or self.param_bounds_tol < 0:
             return
         pmin = np.asarray(b["min"], dtype=np.float64).reshape(1, -1)
         pmax = np.asarray(b["max"], dtype=np.float64).reshape(1, -1)
         if P.shape[1] != pmin.shape[1]:
             raise ValueError("Parameter dimension mismatch vs stored bounds")
 
-        bad = np.any((P < pmin) | (P > pmax), axis=1)
+        mask_inside = np.all(np.logical_and(
+            P > pmin - self.param_bounds_tol,
+            P < pmax + self.param_bounds_tol
+        ), axis=1)
+        return mask_inside
+            
+
+    def _check_param_bounds(self, P: np.ndarray):
+        b = self.train_param_bounds
+        if b is None or self.param_bounds_tol < 0 or self.param_bounds_policy != 'error':
+            return
+        bad = ~self.inside_param_bounds(P)
         if np.any(bad):
             i = int(np.where(bad)[0][0])
+            pmin = np.asarray(b["min"], dtype=np.float64).reshape(1, -1)
+            pmax = np.asarray(b["max"], dtype=np.float64).reshape(1, -1)
+            if self.paramnames is not None:
+                s = ""
+                for j, (pname, plo, phi) in enumerate(zip(self.paramnames, b["min"], b["max"])):
+                    if not (P[i, j] > plo - self.param_bounds_tol and P[i, j] < phi + self.param_bounds_tol):
+                        s += f"Input parameter {j+1} {pname}={P[i,j]} outside training bounds [{plo}..{phi}] (first offending row {i}).\n"
             raise ValueError(
-                f"Input params outside training bounds (first offending row {i}).\n"
+                s + f"Input params outside training bounds (first offending row {i}).\n"
                 f"params={P[i]}\n"
                 f"min={pmin[0]}\n"
-                f"max={pmax[0]}"
+                f"max={pmax[0]}\n"
+                f"paramnames={self.paramnames}"
             )
 
     def _apply_norm_params(self, P: np.ndarray, norm: dict) -> np.ndarray:
@@ -107,6 +148,8 @@ class Emulator:
 
         self._norm = ckpt["norm"]
         self._meta = ckpt.get("meta", {})
+        self.paramnames = self._meta.get("paramnames", None)
+        print(f"loading emulator from {self.model_path}. Meta info: {self._meta}")
 
         self.train_param_bounds = self._meta.get("train_param_bounds", None)
         # validate decoder identity/config if present
@@ -166,6 +209,64 @@ class Emulator:
 
         return f"[P:{in_dim}]-[MLP:{enc_str}]->[latent:{latent_dim}]-{dec_name}-[y:{ydim}]"
 
+
+    # ---------- loss weighting (uncertainty floors) ----------
+    def _loss_variance_torch(self, y: torch.Tensor) -> torch.Tensor:
+        """
+        Return per-sample, per-point sigma in y_pre space, shape (B, D).
+
+        dynamic_range: sigma_dyn = max(y) - dynamic_range   (broadcast to (B,D))
+        func_floor_loss: sigma_func = constant
+        If both given: sigma^2 = sigma_dyn^2 + sigma_func^2  (quadrature)
+        """
+        B, D = y.shape
+        sig2 = None
+
+        if self.dynamic_range is not None:
+            dr = float(self.dynamic_range)
+            ymax = torch.max(y, dim=1, keepdim=True).values  # (B,1)
+            sigma_dyn = ymax - dr                            # (B,1)
+            # ensure strictly positive to avoid div-by-zero / negative variance
+            sigma_dyn = torch.clamp(sigma_dyn, min=1e-12)
+            sig2 = sigma_dyn**2
+
+        if self.func_floor_loss is not None:
+            sigma_func = float(self.func_floor_loss)
+            sigma_func = max(sigma_func, 1e-12)
+            sig2_func = y.new_full((B, 1), sigma_func**2)
+            sig2 = sig2_func if sig2 is None else (sig2 + sig2_func)
+
+        if sig2 is None:
+            # no weighting -> sigma=1
+            return y.new_ones((B, 1)).expand(B, D)
+
+        return sig2.expand(B, D)           # (B,D)
+
+    def _loss_variance_np(self, y: np.ndarray) -> np.ndarray:
+        """
+        Numpy version of _loss_variance_torch. Returns (N,D).
+        """
+        y = np.asarray(y, dtype=np.float64)
+        N, D = y.shape
+        sig2 = None
+
+        if self.dynamic_range is not None:
+            dr = float(self.dynamic_range)
+            ymax = np.max(y, axis=1, keepdims=True)  # (N,1)
+            sigma_dyn = ymax - dr
+            sigma_dyn = np.clip(sigma_dyn, 1e-12, None)
+            sig2 = sigma_dyn**2
+
+        if self.func_floor_loss is not None:
+            sigma_func = max(float(self.func_floor_loss), 1e-12)
+            sig2_func = np.full((N, 1), sigma_func**2, dtype=np.float64)
+            sig2 = sig2_func if sig2 is None else (sig2 + sig2_func)
+
+        if sig2 is None:
+            return np.ones((N, D), dtype=np.float64)
+
+        return np.repeat(sig2, D, axis=1)  # (N,D)
+
     def _apply_dynamic_range_torch(self, yhat: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Apply dynamic-range clamping in the *same space* as yhat,y (y_pre space).
@@ -177,14 +278,11 @@ class Emulator:
         ymax = torch.max(y, dim=1, keepdim=True).values  # (B,1)
 
         # global minimum allowed ymax (in y_pre / standardized-target space)
-        min_ymax = ymax - dr
-        if self.func_floor_loss is not None:
-            min_ymax = torch.clamp(ymax, min=self.func_floor_loss)
-        #print(f"replacing ymax={ymax.min()} with {min_ymax}")
-        ymax = torch.maximum(ymax, min_ymax)
-
         floor = ymax - dr
-        return torch.clamp(yhat, min=floor), torch.clamp(y, min=floor)
+        if self.func_floor_loss is not None:
+            floor = torch.maximum(floor, floor.new_tensor(float(self.func_floor_loss)))
+
+        return soft_floor_torch(yhat, floor=floor), soft_floor_torch(y, floor=floor)
 
     def _apply_dynamic_range_np(self, yhat: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """
@@ -195,28 +293,32 @@ class Emulator:
         dr = float(self.dynamic_range)
         ymax = np.max(y, axis=1, keepdims=True)
 
-        min_ymax = ymax - dr
-        #print(f"replacing ymax={ymax.min()} with {min_ymax}")
-        ymax = np.maximum(ymax, min_ymax)
-        if self.func_floor_loss is not None:
-            min_ymax = np.maximum(ymax, self.func_floor_loss)
-
         floor = ymax - dr
-        return np.maximum(yhat, floor), np.maximum(y, floor)
+        if self.func_floor_loss is not None:
+            floor = np.maximum(floor, self.func_floor_loss)
+
+        return soft_floor_np(yhat, floor=floor), soft_floor_np(y, floor=floor)
 
     def rms_per_sample_torch(self, yhat: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         """
         Returns (B,) RMS in y_pre space, with dynamic-range clamp applied if configured.
         """
         yhat2, y2 = self._apply_dynamic_range_torch(yhat, y)
-        return torch.sqrt(torch.mean((yhat2 - y2) ** 2, dim=1))
+        return torch.sqrt(torch.mean((yhat2 - y2) ** 2 * self.loss_y_weights, dim=1))
+        ivar = 1. / self._loss_variance_torch(y)         # (B,D)
+        r2 = (yhat - y) ** 2
+        w = ivar * self.loss_y_weights
+        return torch.sqrt(torch.mean(r2 * w, dim=1))
 
     def rms_per_sample_np(self, yhat: np.ndarray, y: np.ndarray) -> np.ndarray:
         """
         Returns (N,) RMS in y_pre space, with dynamic-range clamp applied if configured.
         """
         yhat2, y2 = self._apply_dynamic_range_np(np.asarray(yhat), np.asarray(y))
-        return np.sqrt(np.mean((yhat2 - y2) ** 2, axis=1))
+        return np.sqrt(np.mean((yhat2 - y2) ** 2 * self.loss_y_weights, axis=1))
+        ivar = 1. / self._loss_variance_np(y)            # (N,D)
+        r2 = (yhat - y) ** 2
+        return np.sqrt(np.mean(r2 * ivar * self.loss_y_weights, axis=1))
 
     def loss_fn(self, yhat: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         """
@@ -310,12 +412,12 @@ class Emulator:
                 xb = Xtr[sl]
                 tb = Ttr[sl]
 
-                z_norm = torch.clamp(enc(xb), -10, 10)
+                z_norm = torch.clamp(enc(xb), -25, 25)
                 z_phys = z_norm * lat_std + lat_mean
                 y_pre = dec(z_phys)
                 y_hat = (y_pre - y_mean) / y_std
 
-                loss = self.loss_fn(y_hat, tb)
+                loss = self.loss_fn(y_hat, tb)**2
                 opt.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(enc.parameters(), 1.0)
@@ -323,7 +425,7 @@ class Emulator:
 
             enc.eval()
             with torch.no_grad():
-                z_norm = torch.clamp(enc(Xva), -10, 10)
+                z_norm = torch.clamp(enc(Xva), -25, 25)
                 z_phys = z_norm * lat_std + lat_mean
                 y_pre = dec(z_phys)
                 y_hat = (y_pre - y_mean) / y_std
@@ -346,7 +448,7 @@ class Emulator:
 
         # ---- fit statistics on validation set in tolerance space (y_pre, not standardized) ----
         with torch.no_grad():
-            z_norm = torch.clamp(enc(Xva), -10, 10).detach().cpu().numpy()
+            z_norm = torch.clamp(enc(Xva), -25, 25).detach().cpu().numpy()
         z_phys = self._apply_latent_norm_inv(z_norm, norm_info)
 
         zt = torch.tensor(z_phys, dtype=torch.float64, device=self.device)
@@ -386,6 +488,7 @@ class Emulator:
         self._encoder = enc.to(self.device).double().eval()
         self._meta = meta
         self._loaded = True
+        self.paramnames = dataset.paramnames
 
         return self.model_path
 
@@ -415,7 +518,7 @@ class Emulator:
         X = torch.tensor(Pn, dtype=torch.float64, device=self.device)
 
         with torch.no_grad():
-            z_norm = torch.clamp(self._encoder(X), -10, 10).detach().cpu().numpy()
+            z_norm = torch.clamp(self._encoder(X), -25, 25).detach().cpu().numpy()
         z_phys = self._apply_latent_norm_inv(z_norm, norm)
 
         if x is None:
@@ -439,6 +542,9 @@ class Emulator:
             y = 10.0 ** y_pre
         else:
             y = y_pre
+        if self.param_bounds_policy == 'nan':
+            bad = ~self.inside_param_bounds(P)
+            y[bad,:] = np.nan
         return y[0] if squeeze else y
 
     def evaluate(self, dataset: DatasetReader, *, nmax=None, seed=123, return_decoded_params=True):
@@ -464,7 +570,7 @@ class Emulator:
         Pn = self._apply_norm_params(P, norm)
         X = torch.tensor(Pn, dtype=torch.float64, device=self.device)
         with torch.no_grad():
-            z_norm = torch.clamp(self._encoder(X), -10, 10).detach().cpu().numpy()
+            z_norm = torch.clamp(self._encoder(X), -25, 25).detach().cpu().numpy()
         z_phys = self._apply_latent_norm_inv(z_norm, norm)
 
         zt = torch.tensor(z_phys, dtype=torch.float64, device=self.device)
