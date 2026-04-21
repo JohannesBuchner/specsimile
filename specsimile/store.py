@@ -53,6 +53,7 @@ class DatasetWriter:
       /y              (N,Y) float64
       /params         (N,P) float64
       /paramnames     (P,) bytes (utf-8)
+      /ynames         (Y,) bytes (utf-8)   [optional, may be absent]
     Attributes:
       num_data_training, N, xlabel, ylabel, xunit, yunit
     """
@@ -64,6 +65,7 @@ class DatasetWriter:
         x,
         paramnames,
         *,
+        ynames=None,
         xlabel: str = "",
         ylabel: str = "",
         xunit=None,
@@ -94,6 +96,13 @@ class DatasetWriter:
         paramnames_b = _as_bytes_array(paramnames)
         self._f.create_dataset("paramnames", data=paramnames_b)
 
+        if ynames is not None:
+            if len(ynames) != len(x):
+                raise ValueError(
+                    f"ynames length {len(ynames)} must match x length {len(x)}"
+                )
+            self._f.create_dataset("ynames", data=_as_bytes_array(ynames))
+
         self._f.attrs["num_data_training"] = self.num_data_training
         self._f.attrs["N"] = self.N
 
@@ -104,25 +113,38 @@ class DatasetWriter:
 
         self._f.flush()
 
-    def append(self, x, y, params) -> int:
+    def _check_open(self):
         if self._f is None:
             raise RuntimeError("Writer is closed")
+
+    def _check_x(self, x: np.ndarray):
+        x0 = self._f["x"][()]
+        if x.shape != x0.shape or not np.allclose(x, x0, rtol=0, atol=0):
+            raise ValueError("x does not match stored x grid")
+
+    def append(self, x, y, params) -> int:
+        """Write a single row.  Returns the row index written."""
+        self._check_open()
 
         x = np.asarray(x, dtype=np.float64)
         y = np.asarray(y, dtype=np.float64)
         params = np.asarray(params, dtype=np.float64)
 
         if x.ndim != 1 or y.ndim != 1 or params.ndim != 1:
-            raise ValueError("x,y,params must be 1D arrays")
+            raise ValueError("x, y, params must be 1D arrays")
 
-        x0 = self._f["x"][()]
-        if x.shape != x0.shape or not np.allclose(x, x0, rtol=0, atol=0):
-            raise ValueError("x does not match stored x grid")
+        self._check_x(x)
 
         if len(y) != self._f["y"].shape[1]:
-            raise ValueError(f"y length mismatch, got {y[0]} but x.shape={self._f['x'].shape} and y.shape={self._f['y'].shape}")
+            raise ValueError(
+                f"y length mismatch: got {len(y)}, "
+                f"expected {self._f['y'].shape[1]}"
+            )
         if len(params) != self._f["params"].shape[1]:
-            raise ValueError(f"params length mismatch, got {y} but the {self._f['y'].shape[1]} parameters are {self._f['paramnames'][()]}")
+            raise ValueError(
+                f"params length mismatch: got {len(params)}, "
+                f"expected {self._f['params'].shape[1]}"
+            )
 
         i = int(self.num_data_training)
         if i >= int(self.N):
@@ -140,6 +162,78 @@ class DatasetWriter:
             self.close()
 
         return i
+
+    def set(self, x, y, params) -> slice:
+        """
+        Write all rows at once.
+
+        Parameters
+        ----------
+        x      : (X,) array  — must match the stored x grid exactly.
+        y      : (N, Y) array
+        params : (N, P) array
+
+        Returns
+        -------
+        The slice written, i.e. slice(i0, i0 + n_rows).
+
+        Raises
+        ------
+        RuntimeError  if the writer is closed or there is insufficient space.
+        ValueError    if shapes are inconsistent.
+        """
+        self._check_open()
+
+        x = np.asarray(x, dtype=np.float64)
+        y = np.asarray(y, dtype=np.float64)
+        params = np.asarray(params, dtype=np.float64)
+
+        if x.ndim != 1:
+            raise ValueError(f"x must be 1D, got shape {x.shape}")
+        if y.ndim != 2:
+            raise ValueError(f"y must be 2D (N, Y), got shape {y.shape}")
+        if params.ndim != 2:
+            raise ValueError(f"params must be 2D (N, P), got shape {params.shape}")
+
+        n_rows = y.shape[0]
+        if params.shape[0] != n_rows:
+            raise ValueError(
+                f"y and params must have the same number of rows, "
+                f"got y={y.shape}, params={params.shape}"
+            )
+
+        self._check_x(x)
+
+        if y.shape[1] != self._f["y"].shape[1]:
+            raise ValueError(
+                f"y column count mismatch: got {y.shape[1]}, "
+                f"expected {self._f['y'].shape[1]}"
+            )
+        if params.shape[1] != self._f["params"].shape[1]:
+            raise ValueError(
+                f"params column count mismatch: got {params.shape[1]}, "
+                f"expected {self._f['params'].shape[1]}"
+            )
+
+        i0 = int(self.num_data_training)
+        i1 = i0 + n_rows
+        if i1 > int(self.N):
+            raise RuntimeError(
+                f"Not enough space: trying to write rows {i0}..{i1-1} "
+                f"but dataset capacity is N={self.N}."
+            )
+
+        self._f["y"][i0:i1, :] = y
+        self._f["params"][i0:i1, :] = params
+
+        self.num_data_training += n_rows
+        self._f.attrs["num_data_training"] = int(self.num_data_training)
+        self._f.flush()
+
+        if self.num_data_training == self._f["y"].shape[0]:
+            self.close()
+
+        return slice(i0, i1)
 
     def close(self):
         if self._f is not None:
@@ -167,7 +261,8 @@ class DatasetReader:
     Read emulator training dataset from HDF5.
     """
 
-    def __init__(self, filename: str, mode: str = "r", xlabel=None, ylabel=None, xunit=None, yunit=None):
+    def __init__(self, filename: str, mode: str = "r",
+                 xlabel=None, ylabel=None, xunit=None, yunit=None):
         if not os.path.exists(filename):
             raise FileNotFoundError(filename)
         self.filename = filename
@@ -180,12 +275,19 @@ class DatasetReader:
         self.paramnames = _as_str_list(self._f["paramnames"][()])
         self.x = self._f["x"][()].astype(np.float64)
         self.y = self._f["y"][()].astype(np.float64)
+        self.ynames = (
+            _as_str_list(self._f["ynames"][()])
+            if "ynames" in self._f else None
+        )
 
     def __str__(self) -> str:
-        return f'''Dataset(filename={self.filename},
-xlabel={self.xlabel}, xunit={self.xunit}, x={self.x.min()}..{self.x.max()},
-ylabel={self.ylabel}, yunit={self.yunit}, y={self.y.min()}..{self.y.max()},
-)'''
+        return (
+            f"Dataset(filename={self.filename},\n"
+            f"xlabel={self.xlabel}, xunit={self.xunit}, x={self.x.min()}..{self.x.max()},\n"
+            f"ylabel={self.ylabel}, yunit={self.yunit}, y={self.y.min()}..{self.y.max()},\n"
+            f"ynames={self.ynames},\n"
+            f")"
+        )
 
     def __len__(self) -> int:
         return int(self.y.shape[0])

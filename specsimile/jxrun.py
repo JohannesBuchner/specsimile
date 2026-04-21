@@ -1,8 +1,9 @@
-"""functions for using the emulators from jax """
+"""Functions for using the emulators from jax """
 from typing import Dict #, NamedTuple
 import jax
 import jax.numpy as jnp
 import numpy as np
+import torch
 
 
 
@@ -11,27 +12,26 @@ import numpy as np
 # Part 2: Extract weights from PyTorch emulator models (specsimile)
 # ============================================================================
 
-def extract_pytorch_emulator_weights(model_path: str) -> Dict[str, np.ndarray]:
+def extract_pytorch_emulator_weights(model_path: str, verbose: bool=True) -> Dict[str, np.ndarray]:
     """
     Extract weights from a specsimile Emulator saved as a PyTorch checkpoint.
     """
-    import torch
-    
     checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
     result = {}
     
-    print(f"  Loaded {model_path}:")
-    print(f"    top-level keys: { {k: type(v).__name__ for k, v in checkpoint.items()} }")
+    if verbose:
+        print(f"  Loaded {model_path}:")
+        print(f"    top-level keys: { {k: type(v).__name__ for k, v in checkpoint.items()} }")
     
     # Find state dict
     state = None
     for key in ['model_state_dict', 'state_dict', 'encoder_state']:
         if key in checkpoint and isinstance(checkpoint[key], dict):
-            import torch
             has_tensors = any(isinstance(v, torch.Tensor) for v in checkpoint[key].values())
             if has_tensors:
                 state = checkpoint[key]
-                print(f"    Using state dict from '{key}'")
+                if verbose:
+                    print(f"    Using state dict from '{key}'")
                 break
     
     if state is None:
@@ -57,18 +57,22 @@ def extract_pytorch_emulator_weights(model_path: str) -> Dict[str, np.ndarray]:
             result[meta_key] = checkpoint[meta_key]
     
     tensor_keys = sorted([k for k in result if isinstance(result[k], np.ndarray)])
-    print(f"    tensor keys ({len(tensor_keys)}): {tensor_keys}")
+    if verbose:
+        print(f"    tensor keys ({len(tensor_keys)}): {tensor_keys}")
     
     if '_norm' in result:
         norm = result['_norm']
-        print(f"    norm keys: {sorted(norm.keys())}")
+        if verbose:
+            print(f"    norm keys: {sorted(norm.keys())}")
         for nk, nv in sorted(norm.items()):
             if isinstance(nv, dict):
                 for k2, v2 in sorted(nv.items()):
                     shape = v2.shape if hasattr(v2, 'shape') else ''
-                    print(f"      norm[{nk}][{k2}] = {type(v2).__name__} {shape} {v2 if not hasattr(v2, 'shape') else v2.flatten()[:5]}")
+                    if verbose:
+                        print(f"      norm[{nk}][{k2}] = {type(v2).__name__} {shape} {v2 if not hasattr(v2, 'shape') else v2.flatten()[:5]}")
             else:
-                print(f"      norm[{nk}] = {type(nv).__name__} {nv}")
+                if verbose:
+                    print(f"      norm[{nk}] = {type(nv).__name__} {nv}")
     
     return result
 
@@ -242,7 +246,7 @@ def _jax_torus_postprocess(q):
 def load_emulator(path: str, verbose: bool=False) -> dict:
     bundle = {}
         
-    emu_weights = extract_pytorch_emulator_weights(path)
+    emu_weights = extract_pytorch_emulator_weights(path, verbose=verbose)
     
     # Extract Linear layer weights
     weight_keys = sorted([k for k in emu_weights
@@ -264,7 +268,8 @@ def load_emulator(path: str, verbose: bool=False) -> dict:
     
     if jax_layer_idx > 0 and verbose:
         shapes = " -> ".join(str(tuple(bundle[f'W{j}'].shape)) for j in range(jax_layer_idx))
-        print(f"  extracted {jax_layer_idx} layers: {shapes}")
+        if verbose:
+            print(f"  extracted {jax_layer_idx} layers: {shapes}")
     
     # Parse normalization from specsimile checkpoint
     # Structure: norm['params'] = input normalization (mean, std, eps, log_mask)

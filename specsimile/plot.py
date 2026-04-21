@@ -30,6 +30,11 @@ def plot_fit_examples(eval_out, n_first=12, n_worst=12, yscale="log", legend=Fal
     y = eval_out["y_true"]
     yhat = eval_out["yhat"]
     err = eval_out["err"]
+    ynames = eval_out.get("ynames", None)
+
+    # If ynames are available the x-axis is a band index and we switch to
+    # a linear scale with labelled ticks instead of a log frequency axis.
+    use_ynames = ynames is not None and len(ynames) == len(x)
 
     n = len(err)
     n_first = min(int(n_first), n)
@@ -50,12 +55,22 @@ def plot_fit_examples(eval_out, n_first=12, n_worst=12, yscale="log", legend=Fal
     def _plot(ax, i):
         yt = np.asarray(y[i], float)
         yp = np.asarray(yhat[i], float)
-        if yscale == "log":
-            ax.loglog(x, np.clip(yt, 1e-300, None), "k-", lw=1.5, label="true")
-            ax.loglog(x, np.clip(yp, 1e-300, None), "r--", lw=1.2, label="pred")
+        if use_ynames:
+            # Linear x-scale; x is just integer band indices
+            ax.plot(x, np.clip(yt, 1e-300, None), "k-", lw=1.5, label="true")
+            ax.plot(x, np.clip(yp, 1e-300, None), "r--", lw=1.2, label="pred")
+            if yscale == "log":
+                ax.set_yscale("log")
+            # Tick every band, rotated for readability
+            ax.set_xticks(x)
+            ax.set_xticklabels(ynames, rotation=90, fontsize=6)
         else:
-            ax.plot(x, yt, "k-", lw=1.5, label="true")
-            ax.plot(x, yp, "r--", lw=1.2, label="pred")
+            if yscale == "log":
+                ax.loglog(x, np.clip(yt, 1e-300, None), "k-", lw=1.5, label="true")
+                ax.loglog(x, np.clip(yp, 1e-300, None), "r--", lw=1.2, label="pred")
+            else:
+                ax.plot(x, yt, "k-", lw=1.5, label="true")
+                ax.plot(x, yp, "r--", lw=1.2, label="pred")
 
         ax.set_title(f"i={i}  err={err[i]:.3g}", fontsize=9)
         ax.grid(True, which="both", alpha=0.2)
@@ -83,13 +98,19 @@ def plot_fit_diff(eval_out, yscale="log", min_ratio=1.0, min_diff=0.0):
     y = eval_out["y_true"]
     yhat = eval_out["yhat"]
     err = eval_out['err']
+    ynames = eval_out.get("ynames", None)
+
+    # Use ynames as labels when available (DenseDecoder case)
+    use_ynames = ynames is not None and len(ynames) == len(x)
 
     ncol = len(x)
 
     fig, axes = plt.subplots(2, ncol, figsize=(3.2 * ncol, 6.0), squeeze=False)
 
     for i in range(ncol):
-        if len(eval_out.get("labels", [])) == ncol:
+        if use_ynames:
+            ylabel = ynames[i]
+        elif len(eval_out.get("labels", [])) == ncol:
             ylabel = eval_out["labels"][i]
         else:
             ylabel = f"{eval_out['ylabel']} [{i+1}]"

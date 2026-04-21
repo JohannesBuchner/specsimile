@@ -100,7 +100,7 @@ class LogDenseDecoder(DenseDecoder):
     def __init__(self, y_dim: int, eps: float = 1e-30, paramnames=None):
         super().__init__(
             y_dim=y_dim,
-            paramnames=paramnames or [f"logy{i}" for i in range(self.y_dim)])
+            paramnames=paramnames or [f"logy{i}" for i in range(y_dim)])
         self.eps = float(eps)
 
     def normalize(self, y: np.ndarray, params: np.ndarray) -> dict:
