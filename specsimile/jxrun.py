@@ -1,5 +1,5 @@
 """Functions for using the emulators from jax """
-from typing import Dict #, NamedTuple
+from typing import Dict
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -43,7 +43,7 @@ def extract_pytorch_emulator_weights(model_path: str, verbose: bool=True) -> Dic
         elif isinstance(val, np.ndarray):
             result[key] = val
     
-    # Extract normalization - specsimile uses 'norm' not '_norm'
+    # Extract normalization
     for norm_key in ('norm', '_norm'):
         if norm_key in checkpoint and isinstance(checkpoint[norm_key], dict):
             result['_norm'] = checkpoint[norm_key]
@@ -76,75 +76,76 @@ def extract_pytorch_emulator_weights(model_path: str, verbose: bool=True) -> Dic
     
     return result
 
-def _jax_encoder_forward(x, bundle, prefix):
+def jax_encoder_forward(x, bundle, prefix):
     """
-    Forward pass through a specsimile encoder.
-    
-    specsimile pipeline:
-    1. Input: optionally log10 some params (per log_mask), then standardize
-    2. MLP forward with ReLU activations
-    3. Output: denormalize with latent mean/std
-    4. If y_log: the denormalized output represents log10 of the physical quantity
-       (but for decoders like CutoffPL, SBPL, Quadratic, the decoder params 
-        are NOT exponentiated — they're used directly as decoder parameters.
-        Only LogDenseDecoder/DenseDecoder would exponentiate.)
-    
-    IMPORTANT: For CutoffPLDecoder, SBPLDecoder, QuadraticDecoder,
-    y_log=True means the TRAINING target was log10(y), so the network
-    outputs are already the decoder parameters in whatever space they
-    need to be. The denormalization gives back the decoder parameters.
-    We should NOT exponentiate for these decoders.
-    
-    For LogDenseDecoder (used by L_info), y_log=True means the output
-    IS log10 of the physical luminosities, so we DO exponentiate.
-    
-    But actually, looking at emuloader.py more carefully, the Emulator.predict()
-    method returns the DECODER PARAMETERS, not the decoded spectrum.
-    The decoder then interprets those parameters.
-    
-    For CutoffPLDecoder: params are [log_norm, gamma, Ecut_or_log_Ecut]
-    For SBPLDecoder: params are [log_norm, uvslope, plslope, bendloc, log_bendwidth]
-    For QuadraticDecoder: params are [logA, xpeak, sigma]
-    For LogDenseDecoder: params are log10(y_values), so output = 10^params
-    
-    The y_log flag and latent normalization handle this correctly:
-    - Network predicts in standardized space
-    - Denormalize: output = network_out * latent_std + latent_mean
-    - This gives the decoder parameters directly
-    - y_log is about how training data was preprocessed, not about the final step
+    Forward pass through a specsimile encoder stored in *bundle* under *prefix*.
+
+    Handles both plain MLP and ConditionalMLP (when n_context_params > 0).
+
+    Parameters
+    ----------
+    x : jnp.ndarray, shape (N, n_inputs)
+    bundle : dict
+        Parameter bundle as returned by :func:`load_decoder_bundle`.
+    prefix : str
+        Key prefix used when the bundle was built.
+
+    Returns
+    -------
+    h : jnp.ndarray, shape (N, latent_dim)
+        Denormalised latent / decoder parameters.
     """
+    p = f'{prefix}_' if prefix else ''
     h = x
-    
-    # Input: apply log_mask if present, then standardize
-    log_mask_key = f'{prefix}_norm_x_log_mask'
+
+    # --- Input normalisation ------------------------------------------------
+    log_mask_key = f'{p}norm_x_log_mask'
     if log_mask_key in bundle:
         log_mask = bundle[log_mask_key]
-        if np.any(log_mask):
-            eps = bundle.get(f'{prefix}_norm_x_eps', 1e-30)
-            # Only log10 the columns where log_mask is True
-            h_log = jnp.log10(jnp.clip(h, eps, None))
-            h = jnp.where(jnp.array(log_mask)[None, :], h_log, h)
-    
-    x_mean_key = f'{prefix}_norm_x_mean'
-    x_std_key = f'{prefix}_norm_x_std'
+        eps = bundle.get(f'{p}norm_x_eps', 1e-30)
+        h_log = jnp.log10(jnp.clip(h, eps, None))
+        h = jnp.where(jnp.array(log_mask)[None, :], h_log, h)
+
+    x_mean_key = f'{p}norm_x_mean'
+    x_std_key  = f'{p}norm_x_std'
     if x_mean_key in bundle:
         h = (h - bundle[x_mean_key]) / jnp.clip(bundle[x_std_key], 1e-10, None)
+
+    n_context = bundle.get(f'{p}n_context_params', 0)
+
+    acti_name = bundle.get(f'{p}acti', 'LeakyReLU')
+    ctx_acti_name = bundle.get(f'{p}context_acti', 'ReLU')
+    if n_context > 0:
+        # ConditionalMLP: split context and inference parts
+        ctx   = h[:, -n_context:]      # (N, n_context)
+        theta = h[:, :-n_context]      # (N, n_inference)
+
+        # Context embedding
+        ctx_out = ctx
+        ctx_n_layers = bundle.get(f'{p}ctx_n_layers', 0)
+        for i in range(ctx_n_layers):
+            ctx_out = ctx_out @ bundle[f'{p}ctx_W{i}'] + bundle[f'{p}ctx_b{i}']
+            if i < ctx_n_layers - 1:
+                ctx_out = _jax_apply_activation(ctx_out, ctx_acti_name)
+
+        # Concatenate theta + embedding
+        h = jnp.concatenate([theta, ctx_out], axis=1)
     
-    # MLP forward
-    n_layers = bundle[f'{prefix}_n_layers']
+    # --- Main MLP -----------------------------------------------------------
+    n_layers = bundle[f'{p}n_layers']
     for i in range(n_layers):
-        W = bundle[f'{prefix}_W{i}']
-        b = bundle[f'{prefix}_b{i}']
+        W = bundle[f'{p}W{i}']
+        b = bundle[f'{p}b{i}']
         h = h @ W + b
         if i < n_layers - 1:
-            h = jax.nn.leaky_relu(h, negative_slope=0.01)
-        
-    # Output denormalization: decoder_params = network_out * latent_std + latent_mean
-    y_mean_key = f'{prefix}_norm_y_mean'
-    y_std_key = f'{prefix}_norm_y_std'
+            h = _jax_apply_activation(h, acti_name)
+
+    # --- Output denormalisation ---------------------------------------------
+    y_mean_key = f'{p}norm_y_mean'
+    y_std_key  = f'{p}norm_y_std'
     if y_mean_key in bundle:
         h = h * bundle[y_std_key] + bundle[y_mean_key]
-    
+
     return h
 
 def _jax_sigmoid_asinh(x, lo, hi):
@@ -225,125 +226,384 @@ def _jax_quadratic_latent_to_params(z_phys, logx_lo=-1.0, logx_hi=2.0,
     w = 10.0 ** logw
     return jnp.column_stack([logA, xpeak, w])
 
-def _jax_torus_postprocess(q):
+
+def load_emulator(path: str, verbose: bool = False) -> dict:
     """
-    Apply the emuloader.py post-processing for torus quadratic params:
-      logA -> lnA (multiply by ln10)
-      sigma -> sigma_ln (divide by sqrt(ln10))
+    Load a specsimile emulator into a flat bundle **without** a prefix.
+
+    This is the legacy interface used by ``difflike.load_jax_emulator_bundle``
+    which adds its own prefix when merging into the combined bundle::
+
+        for k, v in specsimile.jxrun.load_emulator(path).items():
+            bundle[f'{prefix}_{k}'] = v
+
+    Returns
+    -------
+    dict with keys: W0, b0, …, n_layers, norm_x_mean, norm_x_std, …
     """
-    ln10 = jnp.log(10.0)
-    lnA = q[:, 0] * ln10
-    xpeak = q[:, 1]
-    w = q[:, 2] / jnp.sqrt(ln10)
-    return jnp.column_stack([lnA, xpeak, w])
+    return load_decoder_bundle(path, prefix='', verbose=verbose)
 
+def _jax_apply_activation(h, acti_name: str):
+    if acti_name == 'LeakyReLU':
+        return jax.nn.leaky_relu(h, negative_slope=0.01)
+    elif acti_name == 'ReLU':
+        return jax.nn.relu(h)
+    elif acti_name == 'Tanh':
+        return jnp.tanh(h)
+    elif acti_name == 'Softplus':
+        return jax.nn.softplus(h)
+    elif acti_name == 'GELU':
+        return jax.nn.gelu(h)
+    elif acti_name == 'SELU':
+        return jax.nn.selu(h)
+    elif acti_name == 'LeakySoftplus':
+        beta = 0.99 # positive_slope - negative_slope = 1.0 - 0.01
+        negative_slope = 0.01
+        # softplus(0, beta) = log(2) / beta  (the zero-centering offset)
+        zero = jnp.log(2.0) / beta
+        sp = jnp.log1p(jnp.exp(beta * h)) / beta - zero
+        return sp + negative_slope * h
+    else:
+        raise ValueError(f"Unknown activation: {acti_name!r}")
 
+def load_decoder_bundle(path: str, prefix: str = '', verbose: bool = False) -> dict:
+    """
+    Load a specsimile emulator checkpoint into a flat JAX-compatible parameter
+    bundle.  All keys are prefixed with *prefix* (plus underscore if non-empty).
 
-# ============================================================================
-# Part 4: specsimile emulator loading and forward pass
-# ============================================================================
+    The returned dict contains:
+      {prefix_}W0, {prefix_}b0, ...  – MLP weight/bias matrices
+      {prefix_}n_layers              – number of layers
+      {prefix_}norm_x_mean/std       – input normalisation
+      {prefix_}norm_x_log_mask       – which input columns are log-transformed
+      {prefix_}norm_x_eps            – epsilon for log transform
+      {prefix_}norm_y_mean/std       – latent (output) denormalisation
+      {prefix_}norm_y_log            – whether decoder interprets output as log10
+      {prefix_}norm_y_eps
+      {prefix_}decoder_class         – string name of decoder class
+      {prefix_}n_context_params      – number of context params (for ConditionalMLP)
 
-def load_emulator(path: str, verbose: bool=False) -> dict:
-    bundle = {}
-        
+    Parameters
+    ----------
+    path : str
+        Path to the PyTorch .pt checkpoint.
+    prefix : str
+        Key prefix added to every entry.  Use e.g. ``'hot'`` so that the
+        resulting keys are ``hot_W0``, ``hot_b0``, … matching the convention
+        in *difflike.py*.
+    verbose : bool
+
+    Returns
+    -------
+    dict  (all values are JAX arrays or plain Python scalars/booleans)
+    """
+    p = f'{prefix}_' if prefix else ''
     emu_weights = extract_pytorch_emulator_weights(path, verbose=verbose)
-    
-    # Extract Linear layer weights
-    weight_keys = sorted([k for k in emu_weights
-                          if isinstance(emu_weights[k], np.ndarray)
-                          and k.endswith('.weight')
-                          and emu_weights[k].ndim == 2])
-    
-    jax_layer_idx = 0
-    for w_key in weight_keys:
-        W = emu_weights[w_key]
-        b_key = w_key.replace('.weight', '.bias')
-        if b_key not in emu_weights:
-            continue
-        b = emu_weights[b_key]
-        bundle[f'W{jax_layer_idx}'] = jnp.array(W.T.astype(np.float64))
-        bundle[f'b{jax_layer_idx}'] = jnp.array(b.astype(np.float64))
-        jax_layer_idx += 1
-    bundle['n_layers'] = jax_layer_idx
-    
-    if jax_layer_idx > 0 and verbose:
-        shapes = " -> ".join(str(tuple(bundle[f'W{j}'].shape)) for j in range(jax_layer_idx))
-        if verbose:
-            print(f"  extracted {jax_layer_idx} layers: {shapes}")
-    
-    # Parse normalization from specsimile checkpoint
-    # Structure: norm['params'] = input normalization (mean, std, eps, log_mask)
-    #            norm['latent'] = output denormalization (mean, std, log_mask)
-    #            norm['y'] = {log: bool, eps: float} for final output transform
+    bundle = {}
+
+    # --- MLP weights --------------------------------------------------------
+    # Handle both plain MLP (net.0.weight, net.2.weight, …) and
+    # ConditionalMLP (main_net.0.weight, context_net.0.weight, …).
+    # We only export the *main* (inference) network layers here; the context
+    # network is handled separately when n_context_params > 0.
+
+    # Detect ConditionalMLP vs plain MLP by key names
+    has_conditional = any(k.startswith('main_net.') for k in emu_weights if isinstance(emu_weights[k], np.ndarray))
+
+    # Read n_context_params from checkpoint if present
+    ckpt_raw = torch.load(path, map_location='cpu', weights_only=False)
+    acti_name = ckpt_raw.get('acti', 'LeakyReLU')
+    context_acti_name = ckpt_raw.get('context_acti', 'ReLU')
+    bundle[f'{p}acti'] = acti_name
+    bundle[f'{p}context_acti'] = context_acti_name
+
+    n_context_params = int(ckpt_raw.get('n_context_params', 0))
+    embed_dim = int(ckpt_raw.get('embed_dim', 16))
+    bundle[f'{p}n_context_params'] = n_context_params
+    bundle[f'{p}embed_dim'] = embed_dim
+
+    # Decoder class name (for downstream consumers)
+    meta = ckpt_raw.get('meta', {})
+    dec_meta = meta.get('decoder', {})
+    bundle[f'{p}decoder_class'] = dec_meta.get('class_name', 'Unknown')
+    bundle[f'{p}decoder_config'] = dec_meta.get('config', {})
+
+    pnames = meta.get('paramnames', None)
+    if pnames is not None:
+        bundle[f'{p}paramnames'] = list(pnames)
+
+    ynames = meta.get('ynames', None)
+    if ynames is not None:
+        bundle[f'{p}ynames'] = list(ynames)
+
+    if has_conditional:
+        # --- Main network layers (main_net.0.weight, main_net.0.bias, …) ---
+        main_w_keys = sorted(
+            [k for k in emu_weights
+             if isinstance(emu_weights[k], np.ndarray)
+             and k.startswith('main_net.')
+             and k.endswith('.weight')
+             and emu_weights[k].ndim == 2],
+            key=lambda k: int(k.split('.')[1])
+        )
+        jax_idx = 0
+        for w_key in main_w_keys:
+            b_key = w_key.replace('.weight', '.bias')
+            if b_key not in emu_weights:
+                continue
+            W = emu_weights[w_key]
+            b = emu_weights[b_key]
+            bundle[f'{p}W{jax_idx}'] = jnp.array(W.T.astype(np.float64))
+            bundle[f'{p}b{jax_idx}'] = jnp.array(b.astype(np.float64))
+            jax_idx += 1
+        bundle[f'{p}n_layers'] = jax_idx
+
+        # --- Context network layers (context_net.0.weight, …) --------------
+        ctx_w_keys = sorted(
+            [k for k in emu_weights
+             if isinstance(emu_weights[k], np.ndarray)
+             and k.startswith('context_net.')
+             and k.endswith('.weight')
+             and emu_weights[k].ndim == 2],
+            key=lambda k: int(k.split('.')[1])
+        )
+        ctx_idx = 0
+        for w_key in ctx_w_keys:
+            b_key = w_key.replace('.weight', '.bias')
+            if b_key not in emu_weights:
+                continue
+            W = emu_weights[w_key]
+            b = emu_weights[b_key]
+            bundle[f'{p}ctx_W{ctx_idx}'] = jnp.array(W.T.astype(np.float64))
+            bundle[f'{p}ctx_b{ctx_idx}'] = jnp.array(b.astype(np.float64))
+            ctx_idx += 1
+        bundle[f'{p}ctx_n_layers'] = ctx_idx
+
+    else:
+        # Plain MLP: net.0.weight, net.2.weight, …
+        weight_keys = sorted(
+            [k for k in emu_weights
+             if isinstance(emu_weights[k], np.ndarray)
+             and k.endswith('.weight')
+             and emu_weights[k].ndim == 2],
+            key=lambda k: k
+        )
+        jax_idx = 0
+        for w_key in weight_keys:
+            b_key = w_key.replace('.weight', '.bias')
+            if b_key not in emu_weights:
+                continue
+            W = emu_weights[w_key]
+            b = emu_weights[b_key]
+            bundle[f'{p}W{jax_idx}'] = jnp.array(W.T.astype(np.float64))
+            bundle[f'{p}b{jax_idx}'] = jnp.array(b.astype(np.float64))
+            jax_idx += 1
+        bundle[f'{p}n_layers'] = jax_idx
+
+    if verbose and bundle[f'{p}n_layers'] > 0:
+        shapes = " -> ".join(
+            str(tuple(bundle[f'{p}W{j}'].shape))
+            for j in range(bundle[f'{p}n_layers'])
+        )
+        print(f"  {prefix}: {bundle[f'{p}n_layers']} layers: {shapes}")
+
+    # --- Normalisation ------------------------------------------------------
     if '_norm' in emu_weights:
         norm = emu_weights['_norm']
-        
-        # Input normalization: norm['params']
+
         if 'params' in norm and isinstance(norm['params'], dict):
             p_norm = norm['params']
             if 'mean' in p_norm:
-                bundle['norm_x_mean'] = jnp.array(
+                bundle[f'{p}norm_x_mean'] = jnp.array(
                     np.asarray(p_norm['mean'], dtype=np.float64))
             if 'std' in p_norm:
-                bundle['norm_x_std'] = jnp.array(
+                bundle[f'{p}norm_x_std'] = jnp.array(
                     np.asarray(p_norm['std'], dtype=np.float64))
             if 'log_mask' in p_norm:
-                bundle['norm_x_log_mask'] = np.asarray(
+                bundle[f'{p}norm_x_log_mask'] = np.asarray(
                     p_norm['log_mask'], dtype=bool)
             if 'eps' in p_norm:
-                bundle['norm_x_eps'] = float(p_norm['eps'])
-        # Fallback: norm['x']
+                bundle[f'{p}norm_x_eps'] = float(p_norm['eps'])
         elif 'x' in norm and isinstance(norm['x'], dict):
             x_norm = norm['x']
             if 'mean' in x_norm:
-                bundle['norm_x_mean'] = jnp.array(
+                bundle[f'{p}norm_x_mean'] = jnp.array(
                     np.asarray(x_norm['mean'], dtype=np.float64))
             if 'std' in x_norm:
-                bundle['norm_x_std'] = jnp.array(
+                bundle[f'{p}norm_x_std'] = jnp.array(
                     np.asarray(x_norm['std'], dtype=np.float64))
-        
-        # Output denormalization: norm['latent']
+
         if 'latent' in norm and isinstance(norm['latent'], dict):
             l_norm = norm['latent']
             if 'mean' in l_norm:
-                bundle['norm_y_mean'] = jnp.array(
+                bundle[f'{p}norm_y_mean'] = jnp.array(
                     np.asarray(l_norm['mean'], dtype=np.float64))
             if 'std' in l_norm:
-                bundle['norm_y_std'] = jnp.array(
+                bundle[f'{p}norm_y_std'] = jnp.array(
                     np.asarray(l_norm['std'], dtype=np.float64))
             if 'log_mask' in l_norm:
-                bundle['norm_y_log_mask'] = np.asarray(
+                bundle[f'{p}norm_y_log_mask'] = np.asarray(
                     l_norm['log_mask'], dtype=bool)
-        # Fallback: norm['y'] for mean/std
         elif 'y' in norm and isinstance(norm['y'], dict):
-            y_norm = norm['y']
-            if 'mean' in y_norm:
-                bundle['norm_y_mean'] = jnp.array(
-                    np.asarray(y_norm['mean'], dtype=np.float64))
-            if 'std' in y_norm:
-                bundle['norm_y_std'] = jnp.array(
-                    np.asarray(y_norm['std'], dtype=np.float64))
-        
-        # Final output transform: norm['y']['log'] and norm['y']['eps']
+            y_norm_dict = norm['y']
+            if 'mean' in y_norm_dict:
+                bundle[f'{p}norm_y_mean'] = jnp.array(
+                    np.asarray(y_norm_dict['mean'], dtype=np.float64))
+            if 'std' in y_norm_dict:
+                bundle[f'{p}norm_y_std'] = jnp.array(
+                    np.asarray(y_norm_dict['std'], dtype=np.float64))
+
         if 'y' in norm and isinstance(norm['y'], dict):
-            y_norm = norm['y']
-            if 'log' in y_norm:
-                bundle['norm_y_log'] = bool(y_norm['log'])
-            if 'eps' in y_norm:
-                bundle['norm_y_eps'] = float(y_norm['eps'])
-        
+            y_norm_dict = norm['y']
+            if 'log' in y_norm_dict:
+                bundle[f'{p}norm_y_log'] = bool(y_norm_dict['log'])
+            if 'eps' in y_norm_dict:
+                bundle[f'{p}norm_y_eps'] = float(y_norm_dict['eps'])
+
         if verbose:
-            print(f"  norm: x_mean={'yes' if 'norm_x_mean' in bundle else 'no'}"
-                  f" x_std={'yes' if 'norm_x_std' in bundle else 'no'}"
-                  f" y_mean={'yes' if 'norm_y_mean' in bundle else 'no'}"
-                  f" y_std={'yes' if 'norm_y_std' in bundle else 'no'}"
-                  f" y_log={bundle.get('norm_y_log', False)}"
-                  f" y_eps={bundle.get('norm_y_eps', 'none')}")
-            if 'norm_x_mean' in bundle:
-                print(f"    x_mean={np.array(bundle['norm_x_mean'])[:5]}")
-                print(f"    x_std ={np.array(bundle['norm_x_std'])[:5]}")
-            if 'norm_y_mean' in bundle:
-                print(f"    y_mean={np.array(bundle['norm_y_mean'])[:5]}")
-                print(f"    y_std ={np.array(bundle['norm_y_std'])[:5]}")
+            print(f"  {prefix} norm: "
+                  f"x_mean={'yes' if f'{p}norm_x_mean' in bundle else 'no'} "
+                  f"x_std={'yes' if f'{p}norm_x_std' in bundle else 'no'} "
+                  f"y_mean={'yes' if f'{p}norm_y_mean' in bundle else 'no'} "
+                  f"y_std={'yes' if f'{p}norm_y_std' in bundle else 'no'} "
+                  f"y_log={bundle.get(f'{p}norm_y_log', False)}")
 
     return bundle
+
+
+
+def get_bundle_paramnames(bundle: dict, prefix: str) -> list:
+    """
+    Return the input parameter names for the emulator stored under *prefix*.
+
+    Raises
+    ------
+    KeyError
+        If the bundle does not contain paramnames for this prefix (e.g. the
+        checkpoint was saved before paramnames were recorded in meta).
+    """
+    p = f'{prefix}_' if prefix else ''
+    key = f'{p}paramnames'
+    return list(bundle[key])
+
+
+def get_bundle_ynames(bundle: dict, prefix: str) -> list:
+    """
+    Return the output (y) column names for the emulator stored under *prefix*.
+
+    Raises
+    ------
+    KeyError
+        If the bundle does not contain ynames for this prefix.
+    """
+    p = f'{prefix}_' if prefix else ''
+    key = f'{p}ynames'
+    if key not in bundle:
+        raise KeyError(
+            f"Bundle does not contain '{key}'. "
+            f"Re-save the emulator so that meta['ynames'] is stored."
+        )
+    return list(bundle[key])
+
+def jax_encoder_forward_kw(
+    bundle: dict,
+    prefix: str,
+    kwargs,
+) -> "jnp.ndarray | dict":
+    """
+    Keyword-argument wrapper around :func:`jax_encoder_forward`.
+
+    Instead of passing a pre-stacked ``(N, n_params)`` array you pass each
+    input feature by name.  The function looks up the stored ``paramnames``
+    for this emulator, assembles the columns in the correct order, and calls
+    the underlying forward pass.
+
+    Parameters
+    ----------
+    bundle : dict
+        Parameter bundle as returned by :func:`load_decoder_bundle` or
+        :func:`load_emulator`.  Must contain ``{prefix}_paramnames`` and,
+        when *return_dict* is True, ``{prefix}_ynames``.
+    prefix : str
+        Key prefix under which the emulator was stored, e.g. ``'hot'``.
+    kwargs : jnp.ndarray, shape (N,) each
+        One keyword argument per input feature, named exactly as stored in
+        ``paramnames``.  All arrays must have the same leading dimension N.
+
+    Returns
+    -------
+    jnp.ndarray, shape (N, n_outputs)
+        Raw encoder output, denormalised but before any decoder transform.
+
+    Raises
+    ------
+    KeyError
+        If a required input feature is missing from *kwargs*, or if the
+        bundle does not contain paramnames / ynames.
+
+    Examples
+    --------
+    >>> out = jax_encoder_forward_kw(bundle, 'L',
+    ...     M_BH=log10_M_BH, log_mdot=log_mdot, cos_inc=cos_inc, ...)
+    >>> logLUV = out['LUV']          # (N,)
+    >>> logL2keV = out['L2keV']      # (N,)
+    """
+    paramnames = get_bundle_paramnames(bundle, prefix)
+
+    # --- Assemble input array in the order the emulator was trained on ------
+    # Collect columns
+    x = jnp.column_stack([kwargs[name] for name in paramnames])
+
+    # --- Forward pass -------------------------------------------------------
+    h = jax_encoder_forward(x, bundle, prefix)   # (N, n_outputs)
+
+    return h
+
+def jax_encoder_forward_kw_dict(
+    bundle: dict,
+    prefix: str,
+    kwargs,
+) -> "jnp.ndarray | dict":
+    """
+    Keyword-argument wrapper around :func:`jax_encoder_forward`.
+
+    Instead of passing a pre-stacked ``(N, n_params)`` array you pass each
+    input feature by name.  The function looks up the stored ``paramnames``
+    for this emulator, assembles the columns in the correct order, and calls
+    the underlying forward pass.
+
+    Parameters
+    ----------
+    bundle : dict
+        Parameter bundle as returned by :func:`load_decoder_bundle` or
+        :func:`load_emulator`.  Must contain ``{prefix}_paramnames`` and,
+        when *return_dict* is True, ``{prefix}_ynames``.
+    prefix : str
+        Key prefix under which the emulator was stored, e.g. ``'hot'``.
+    **kwargs : jnp.ndarray, shape (N,) each
+        One keyword argument per input feature, named exactly as stored in
+        ``paramnames``.  All arrays must have the same leading dimension N.
+
+    Returns
+    -------
+    dict[str, jnp.ndarray]
+        Keys are the ynames of the emulator; values are ``(N,)`` arrays.
+
+    Raises
+    ------
+    KeyError
+        If a required input feature is missing from *kwargs*, or if the
+        bundle does not contain paramnames / ynames.
+
+    Examples
+    --------
+    >>> out = jax_encoder_forward_kw(bundle, 'L',
+    ...     M_BH=log10_M_BH, log_mdot=log_mdot, cos_inc=cos_inc, ...)
+    >>> logLUV = out['LUV']          # (N,)
+    >>> logL2keV = out['L2keV']      # (N,)
+    """
+    h = jax_encoder_forward_kw(bundle, prefix, kwargs)
+
+    # --- Wrap output in a dict keyed by ynames ------------------------------
+    ynames = get_bundle_ynames(bundle, prefix)
+    return {name: h[:, i] for i, name in enumerate(ynames)}
