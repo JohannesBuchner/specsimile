@@ -8,8 +8,6 @@ import torch.nn.functional as F
 from . import utils
 from .store import DatasetReader
 
-LOGTHRESH = float(np.log10(3.0))
-
 
 class LeakySoftplus(nn.Module):
     """Smooth, zero-centered activation with a configurable negative slope.
@@ -98,19 +96,23 @@ def getacti(actiname):
 
 
 class MLP(nn.Module):
-    def __init__(self, nin: int, nout: int, shape: list[int], acti='LeakyReLU'):
+    def __init__(self, nin: int, nout: int, shape: list[int],
+                 acti='LeakyReLU', dropout: float = 0.0):
         super().__init__()
         self.acti = acti
         layers = []
         prev = nin
         for width in shape:
             layers += [nn.Linear(prev, width), getacti(acti)()]
+            if dropout > 0.0:
+                layers += [nn.Dropout(p=dropout)]
             prev = width
         layers += [nn.Linear(prev, nout)]
         self.net = nn.Sequential(*layers)
 
     def forward(self, x):
         return self.net(x)
+
 
 class ConditionalMLP(nn.Module):
     """
@@ -133,11 +135,13 @@ class ConditionalMLP(nn.Module):
         embed_dim: int = 16,
         acti: str = 'Tanh',
         context_acti: str = 'LeakyReLU',
+        dropout: float = 0.0,
     ):
         super().__init__()
         self.n_context = n_context
         self.n_inference = n_inference
         self.acti_name = acti
+        self.dropout = dropout
         acti_cls = getacti(acti)
         context_acti_cls = getacti(context_acti)
         
@@ -155,6 +159,8 @@ class ConditionalMLP(nn.Module):
         prev = n_inference + embed_dim
         for width in shape:
             main_layers += [nn.Linear(prev, width), acti_cls()]
+            if dropout > 0.0:
+                main_layers += [nn.Dropout(p=dropout)]
             prev = width
         main_layers += [nn.Linear(prev, nout)]
         self.main_net = nn.Sequential(*main_layers)
@@ -200,7 +206,7 @@ class Emulator:
         param_bounds_policy: str = 'error',
         smooth_weight: float = 0.0,
         smooth_frac: float = 1e-4,
-        smooth_max_rel_change: float = 0.01,
+        dropout: float = 0,
     ):
         """
         Parameters
@@ -211,10 +217,6 @@ class Emulator:
         smooth_frac : float
             Step size as a fraction of the per-parameter training range
             (hi - lo).  Default 1e-4 means a step of 0.01 % of the range.
-        smooth_max_rel_change : float
-            Target maximum relative flux change for a step of smooth_frac.
-            Default 0.01 (1 %).  Used only to set the scale of the penalty;
-            the penalty drives changes toward zero, so this is a soft target.
         """
         self.model_path = str(model_path)
         self.decoder = decoder
@@ -237,15 +239,16 @@ class Emulator:
         self.train_param_bounds: dict | None = None
         self.param_bounds_policy = param_bounds_policy
         self.param_bounds_tol: float = 0.0
-        self.ynames: list[str] | None = None
+        self.xnames: list[str] | None = None
 
+        self.paramnames: list | None = None
         self.n_context_params = int(n_context_params)
         self.embed_dim = int(embed_dim)
         self.context_acti = context_acti
+        self.dropout = dropout
 
         self.smooth_weight = float(smooth_weight)
         self.smooth_frac = float(smooth_frac)
-        self.smooth_max_rel_change = float(smooth_max_rel_change)
         # set during fit() once the parameter ranges are known
         self._smooth_step: torch.Tensor | None = None
 
@@ -338,17 +341,146 @@ class Emulator:
         mean, std = self._y_mean_std(norm, Ypre.shape[1])
         return (Ypre - mean[None, :]) / std[None, :]
 
-    def _build_smooth_step(self, Pmin, Pmax, norm):
+    def _build_smooth_step(self, Pmin_inf, Pmax_inf, norm):
+        """
+        Build per-parameter step sizes in *normalised* input space.
+
+        Parameters
+        ----------
+        Pmin_inf, Pmax_inf : (n_inf,) arrays
+            Physical min/max of the inference parameters only
+            (context params excluded).
+        norm : dict
+            Normalisation info from decoder.normalize().
+
+        Returns
+        -------
+        torch.Tensor, shape (1, n_inf)
+            Step size for each inference parameter in normalised space.
+        """
         pn = norm["params"]
         std_norm = np.asarray(pn["std"], dtype=np.float64)
-        delta_phys = self.smooth_frac * (Pmax - Pmin)
-        delta_norm = delta_phys / np.clip(std_norm, 1e-30, None)
-        # zero out context params (last n_context_params columns)
-        if self.n_context_params > 0:
-            delta_norm[-self.n_context_params:] = 0.0
+        n_inf = len(Pmin_inf)
+        std_norm_inf = std_norm[:n_inf]                        # inference params only
+
+        delta_phys = self.smooth_frac * (Pmax_inf - Pmin_inf) # physical step
+        delta_norm = delta_phys / np.clip(std_norm_inf, 1e-30, None)  # normalised step
+
         return torch.tensor(
             delta_norm.reshape(1, -1), dtype=torch.float64, device=self.device
         )
+    def _taylor_consistency_penalty(
+        self, xb, enc, dec, lat_mean, lat_std, y_mean, y_std,
+        direction, *, create_graph: bool = True,
+    ):
+        """
+        Penalise gradients inconsistent with nearby function values.
+
+            residual = f(x + delta) - f(x) - delta · grad_f(x)
+
+        Parameters
+        ----------
+        create_graph : bool
+            True during training (penalty must be differentiable w.r.t. weights).
+            False during validation (only need the scalar value).
+        """
+        B = xb.shape[0]
+        n_ctx = self.n_context_params
+
+        assert self._smooth_step is not None
+        # _smooth_step: (1, n_inf), already in normalised-input units,
+        # scaled by the physical parameter range fraction smooth_frac.
+        delta_inf = direction * self._smooth_step          # (B, n_inf)
+
+        # Pad context dimensions with zero (context does not move)
+        if n_ctx > 0:
+            delta_full = torch.cat([
+                delta_inf,
+                xb.new_zeros(B, n_ctx),
+            ], dim=1)
+        else:
+            delta_full = delta_inf
+
+        def forward_standardized(x_in):
+            z_norm = torch.clamp(enc(x_in), -25, 25)
+            z_phys = z_norm * lat_std + lat_mean
+            y_pre  = dec(z_phys)
+            return (y_pre - y_mean) / y_std
+
+        # --- f(x + delta): detached, no gradient needed ---
+        with torch.no_grad():
+            fx_perturbed = forward_standardized(xb + delta_full)   # (B, Y)
+
+        # --- f(x): keep in graph so encoder weights get gradients ---
+        # Do NOT detach xb. The gradient of the penalty w.r.t. encoder
+        # weights flows through fx -> enc(xb) -> encoder parameters.
+        xb_req = xb.requires_grad_(True)  # in-place, no detach
+        fx = forward_standardized(xb_req)
+
+        # --- grad_f(x) w.r.t. xb: needs create_graph=True so that
+        #     the gradient of (residual^2) w.r.t. encoder weights
+        #     can be computed via the chain:
+        #     residual -> linear_prediction -> grad_fx -> fx -> enc weights
+        # ---
+        grad_fx = torch.autograd.grad(
+            outputs=fx.sum(),
+            inputs=xb_req,
+            create_graph=create_graph,
+            retain_graph=True,         # fx is used again below for residual
+        )[0]                                                       # (B, n_input)
+
+        # --- Taylor residual ---
+        linear_prediction = (grad_fx * delta_full).sum(dim=1, keepdim=True)  # (B, 1)
+
+        # fx_perturbed is detached (computed under no_grad).
+        # fx is in the graph — this is what lets the penalty train the encoder.
+        residual = (fx_perturbed - fx) - linear_prediction                    # (B, Y)
+
+        return (residual ** 2).mean()
+
+    def _gradient_magnitude_penalty(
+        self, xb, enc, dec, lat_mean, lat_std, y_mean, y_std,
+        *, create_graph: bool = True,
+    ):
+        """
+        Penalise large input-gradients at training points.
+
+        Computes d f(x) / d x_inf (inference dims only) and penalises
+        its squared magnitude. This directly discourages spikes in the
+        learned function at training locations.
+
+        For a piecewise-linear network (LeakyReLU), this penalises the
+        slope of each active linear piece, pushing the network toward
+        shallower, wider pieces — exactly what reduces gradient noise
+        seen by HMC.
+        """
+        B = xb.shape[0]
+        n_ctx = self.n_context_params
+        n_inf = xb.shape[1] - n_ctx
+
+        def forward_standardized(x_in):
+            z_norm = torch.clamp(enc(x_in), -25, 25)
+            z_phys = z_norm * lat_std + lat_mean
+            y_pre  = dec(z_phys)
+            return (y_pre - y_mean) / y_std        # (B, Y)
+
+        xb_req = xb.detach().requires_grad_(True)
+        fx = forward_standardized(xb_req)          # (B, Y)
+
+        # Sum over outputs and batch to get a scalar, then differentiate.
+        # create_graph=True so that loss.backward() can propagate through
+        # grad_fx back to the encoder weights.
+        grad_fx = torch.autograd.grad(
+            outputs=fx.sum(),
+            inputs=xb_req,
+            create_graph=create_graph,
+        )[0]                                       # (B, n_input)
+
+        # Penalise only inference dims (context is fixed during HMC anyway)
+        grad_inf = grad_fx[:, :n_inf]              # (B, n_inf)
+
+        return (grad_inf ** 2).mean()
+
 
     def _gradient_penalty(self, xb, enc, dec, lat_mean, lat_std, y_mean, y_std):
         if self.smooth_weight == 0.0:
@@ -393,8 +525,6 @@ class Emulator:
             )
             directional_deriv = jvp_fn(x_inf, v)
 
-        # Now log10_target scaling is still meaningful but now in standardized units.
-        # You may want to drop the log10_target normalization and just use raw penalty:
         return (directional_deriv ** 2).mean()
 
     # ---------- checkpoint IO ----------
@@ -403,12 +533,12 @@ class Emulator:
         if not os.path.exists(self.model_path):
             raise FileNotFoundError(self.model_path)
 
-        ckpt = torch.load(self.model_path, map_location="cpu")
+        ckpt = torch.load(self.model_path, map_location="cpu", weights_only=False)
 
         self._norm = ckpt["norm"]
         self._meta = ckpt.get("meta", {})
         self.paramnames = self._meta.get("paramnames", None)
-        self.ynames = self._meta.get("ynames", None)
+        self.xnames = self._meta.get("xnames", None)
 
         if verbose:
             print(f"loading emulator from {self.model_path}:")
@@ -443,6 +573,7 @@ class Emulator:
         self.n_context_params = int(ckpt.get("n_context_params", 0))
         self.embed_dim = int(ckpt.get("embed_dim", 16))
         self.context_acti = ckpt.get("context_acti", "ReLU")
+        self.dropout = float(ckpt.get('dropout', 0.0))
 
         nin = int(ckpt["nin"])
         nout = int(ckpt["nout"])
@@ -456,9 +587,12 @@ class Emulator:
                 embed_dim=self.embed_dim,
                 acti=self.acti,
                 context_acti=self.context_acti,
+                dropout=self.dropout,
             ).to(self.device).double()
         else:
-            self._encoder = MLP(nin=nin, nout=nout, shape=self.shape, acti=self.acti).to(self.device).double()
+            self._encoder = MLP(
+                nin=nin, nout=nout, shape=self.shape, acti=self.acti, dropout=self.dropout,
+            ).to(self.device).double()
         self._encoder.load_state_dict(ckpt["encoder_state"])
         self._encoder.to(self.device).double().eval()
         self._loaded = True
@@ -480,6 +614,7 @@ class Emulator:
             n_context_params=self.n_context_params,
             embed_dim=self.embed_dim,
             context_acti=self.context_acti,
+            dropout=self.dropout,
             norm=norm,
             meta=meta,
             nin=int(nin),
@@ -495,10 +630,12 @@ class Emulator:
         enc_str = "-".join(str(w) for w in self.shape)
         dec_name = self.decoder.__class__.__name__.replace("Decoder", "")
         latent_dim = getattr(self.decoder, "latent_dim", "?")
-        enc_str += f'{self.acti}'
+        enc_str += f'^{self.acti}'
         if self.n_context_params:
             enc_str += f'|{self.n_context_params:d}'
             enc_str += f'{self.context_acti}'
+        if self.dropout > 0:
+            enc_str += f'|Drop{self.dropout}'
         return (
             f"[P:{in_dim}]-[MLP:{enc_str}]->[latent:{latent_dim}]"
             f"-{dec_name}-[y:{ydim}]"
@@ -589,7 +726,7 @@ class Emulator:
 
         floor = ymax - dr
         if self.func_floor_loss is not None:
-            floor = np.maximum(floor, self.func_floor_loss)
+            floor = np.maximum(floor, float(self.func_floor_loss))
 
         return soft_floor_np(yhat, floor=floor), soft_floor_np(y, floor=floor)
 
@@ -694,6 +831,7 @@ class Emulator:
                 embed_dim=self.embed_dim,
                 acti=self.acti,
                 context_acti=self.context_acti,
+                dropout=self.dropout,
             ).to(self.device).double()
         else:
             enc = MLP(nin=nin, nout=nout, shape=self.shape, acti=self.acti).to(self.device).double()
@@ -722,13 +860,14 @@ class Emulator:
         y_std = torch.tensor(
             y_std_np.reshape(1, -1), dtype=dtype, device=self.device
         )
-        #if self.smooth_weight > 0.0:
-        #    # prepare random directions in R^P, uniform on the unit ball,
-        #    # then scale each component by the per-parameter step size
-        #    rand_normal = torch.tensor(
-        #        rng.standard_normal(Xtr.shape),
-        #        dtype=Xtr.dtype, device=Xtr.device,
-        #    )
+        if self.smooth_weight > 0.0:
+            n_inf = P.shape[1] - self.n_context_params
+            # prepare random directions in R^P, uniform on the unit ball,
+            # then scale each component by the per-parameter step size
+            # --- Build perturbation in inference-param space only ---
+            self._smooth_step = self._build_smooth_step(
+                Pmin[:n_inf], Pmax[:n_inf], norm_info
+            )
 
         best = np.inf
         best_state = None
@@ -737,6 +876,11 @@ class Emulator:
         for ep in range(int(epochs)):
             enc.train()
             perm = rng.permutation(len(Xtr))
+            if self.smooth_weight > 0.0:
+                rand_normal = torch.randn(len(Xtr), n_inf, dtype=Xtr.dtype, device=Xtr.device)
+                rand_normal = rand_normal / (rand_normal.norm(dim=1, keepdim=True) + 1e-30)
+                rand_normal_va = torch.randn(len(Xva), n_inf, dtype=Xva.dtype, device=Xva.device)
+                rand_normal_va = rand_normal_va / (rand_normal_va.norm(dim=1, keepdim=True) + 1e-30)
             for i0 in range(0, len(Xtr), batch_size):
                 sl = perm[i0: i0 + batch_size]
                 xb = Xtr[sl]
@@ -750,9 +894,19 @@ class Emulator:
                 main_loss = self.loss_fn(y_hat, tb) ** 2
 
                 if self.smooth_weight > 0.0:
-                    smooth_loss = self._gradient_penalty(
-                        xb, enc, dec, lat_mean, lat_std, y_mean, y_std
-                    )
+                    if True:
+                        smooth_loss = self._taylor_consistency_penalty(
+                            xb, enc, dec, lat_mean, lat_std, y_mean, y_std,
+                            # instead of sl, we intentionally use i0, to have linearly increasing memory access
+                            # the numbers are random anyway.
+                            direction=rand_normal[i0: i0 + batch_size],
+                            create_graph=True,  # differentiable
+                        )
+                    else:
+                        smooth_loss = self._gradient_magnitude_penalty(
+                            xb, enc, dec, lat_mean, lat_std, y_mean, y_std,
+                            create_graph=True,
+                        )
                     loss = main_loss + self.smooth_weight * smooth_loss
                 else:
                     loss = main_loss
@@ -773,19 +927,31 @@ class Emulator:
                 vloss = self.loss_fn(y_hat, Tva).item() ** 2
 
             if self.smooth_weight > 0.0:
+                # No torch.no_grad() here: _taylor_consistency_penalty needs
+                # autograd.grad for f(x), even with create_graph=False.
+                # But enc should remain in eval() mode.
+                
                 # Sample a subset to keep validation fast
-                vsmooth = self._gradient_penalty(
-                    Xva, enc, dec, lat_mean, lat_std, y_mean, y_std,
-                ).item()
+                if True:
+                    vsmooth = self._taylor_consistency_penalty(
+                        Xva, enc, dec, lat_mean, lat_std, y_mean, y_std,
+                        direction=rand_normal_va,
+                        create_graph=False,  # not differentiable
+                    ).item()
+                else:
+                    vsmooth = self._gradient_magnitude_penalty(
+                        Xva, enc, dec, lat_mean, lat_std, y_mean, y_std,
+                        create_graph=False,
+                    ).item()
                 vtotal = vloss + self.smooth_weight * vsmooth
                 loss_str = (
-                    f"RMS={vloss:.3f}  "
+                    f"MSE={vloss:.3f}  "
                     f"+smooth={vsmooth:.3f} * {self.smooth_weight} -> "
                     f"{vtotal:.3f}"
                 )
             else:
                 vtotal = vloss
-                loss_str = f"RMS={vloss:.3f}"
+                loss_str = f"MSE={vloss:.3f}"
 
             if vtotal < best - 1e-4:
                 best = vtotal
@@ -825,11 +991,11 @@ class Emulator:
         self.fit_mean = float(np.mean(err))
         self.fit_median = float(np.percentile(err, 50))
         self.fit_p95 = float(np.percentile(err, 95))
-        self.ynames = dataset.ynames
+        self.xnames = dataset.xnames
 
         meta = dict(
             paramnames=dataset.paramnames,
-            ynames=dataset.ynames,
+            xnames=dataset.xnames,
             xlabel=dataset.xlabel,
             ylabel=dataset.ylabel,
             xunit=dataset.xunit,
@@ -928,10 +1094,10 @@ class Emulator:
 
     def to_dict(self, y: np.ndarray) -> dict[str, np.ndarray]:
         """
-        Convert a y array (N, Y) or (Y,) into a dict keyed by ynames.
+        Convert a y array (N, Y) or (Y,) into a dict keyed by xnames.
 
-        Requires that ynames were stored during training (i.e. the dataset
-        had a ynames column).  Raises RuntimeError if ynames are unavailable.
+        Requires that xnames were stored during training (i.e. the dataset
+        had a xnames column).  Raises RuntimeError if xnames are unavailable.
 
         Parameters
         ----------
@@ -941,22 +1107,22 @@ class Emulator:
         -------
         dict mapping each output name to its column, shape (N,) or scalar.
         """
-        if self.ynames is None:
+        if self.xnames is None:
             raise RuntimeError(
-                "ynames are not available for this emulator.  "
-                "Re-train with a dataset that has ynames set, or set "
-                "emulator.ynames manually."
+                "xnames are not available for this emulator.  "
+                "Re-train with a dataset that has xnames set, or set "
+                "emulator.xnames manually."
             )
         y = np.asarray(y)
         squeeze = y.ndim == 1
         if squeeze:
             y = y[None, :]
-        if y.shape[1] != len(self.ynames):
+        if y.shape[1] != len(self.xnames):
             raise ValueError(
-                f"y has {y.shape[1]} columns but ynames has "
-                f"{len(self.ynames)} entries"
+                f"y has {y.shape[1]} columns but xnames has "
+                f"{len(self.xnames)} entries"
             )
-        result = {name: y[:, i] for i, name in enumerate(self.ynames)}
+        result = {name: y[:, i] for i, name in enumerate(self.xnames)}
         if squeeze:
             result = {k: v[0] for k, v in result.items()}
         return result
@@ -1027,7 +1193,7 @@ class Emulator:
             z_norm=z_norm,
             z_phys=z_phys,
             dec_params=dec_params,
-            ynames=self.ynames,
+            xnames=self.xnames,
             xlabel=dataset.xlabel,
             ylabel=dataset.ylabel,
             xunit=dataset.xunit,

@@ -30,11 +30,11 @@ def plot_fit_examples(eval_out, n_first=12, n_worst=12, yscale="log", legend=Fal
     y = eval_out["y_true"]
     yhat = eval_out["yhat"]
     err = eval_out["err"]
-    ynames = eval_out.get("ynames", None)
+    xnames = eval_out.get("xnames", None)
 
-    # If ynames are available the x-axis is a band index and we switch to
+    # If xnames are available the x-axis is a band index and we switch to
     # a linear scale with labelled ticks instead of a log frequency axis.
-    use_ynames = ynames is not None and len(ynames) == len(x)
+    use_xnames = xnames is not None and len(xnames) == len(x)
 
     n = len(err)
     n_first = min(int(n_first), n)
@@ -55,7 +55,7 @@ def plot_fit_examples(eval_out, n_first=12, n_worst=12, yscale="log", legend=Fal
     def _plot(ax, i):
         yt = np.asarray(y[i], float)
         yp = np.asarray(yhat[i], float)
-        if use_ynames:
+        if use_xnames:
             # Linear x-scale; x is just integer band indices
             ax.plot(x, np.clip(yt, 1e-300, None), "k-", lw=1.5, label="true")
             ax.plot(x, np.clip(yp, 1e-300, None), "r--", lw=1.2, label="pred")
@@ -63,7 +63,7 @@ def plot_fit_examples(eval_out, n_first=12, n_worst=12, yscale="log", legend=Fal
                 ax.set_yscale("log")
             # Tick every band, rotated for readability
             ax.set_xticks(x)
-            ax.set_xticklabels(ynames, rotation=90, fontsize=6)
+            ax.set_xticklabels(xnames, rotation=90, fontsize=6)
         else:
             if yscale == "log":
                 ax.loglog(x, np.clip(yt, 1e-300, None), "k-", lw=1.5, label="true")
@@ -93,23 +93,83 @@ params={" ".join(['%.2f' % v for v in eval_out["dec_params"][i]]) if eval_out.ge
     fig.tight_layout()
     return fig, axes
 
+def plot_residual_hist(eval_out, bins=50, yscale="log"):
+    """
+    One panel with one histogram per x-grid point showing (pred - true).
+
+    Parameters
+    ----------
+    eval_out : dict
+        Output of Emulator.evaluate().
+    bins : int
+        Number of histogram bins.
+    yscale : 'linear' or 'log'
+        If True, use  log10(yhat / y_true) (log10 space residuals).
+        If False, use yhat - y_true (linear residuals).
+
+    Returns
+    -------
+    fig: object
+        matplotlib figure
+    ax: object
+        matplotlib axis.
+    """
+    # spectral grid 
+    x = np.asarray(eval_out["x"], float)
+    ncol = len(x)
+
+    # name of the flux axis, and units
+    ylabel  = eval_out.get("ylabel", "")
+    yunit   = eval_out.get("yunit", "")
+    if eval_out.get('xnames', None) is not None and len(eval_out['xnames']) == ncol:
+        xnames = eval_out['xnames']
+    else:
+        xlabel  = eval_out.get("xlabel", "")
+        xnames = [f"{xlabel} {x[i]:.3g}" for i in range(ncol)]
+
+    if yscale == 'log':
+        pred = np.asarray(eval_out["yhat"], float)         # (N, n_x), linear space
+        true = np.asarray(eval_out["y_true"], float)       # (N, n_x), linear space
+        residuals = np.log10((pred + 1e-60) / (true + 1e-50))
+        res_label = r"$\log(\hat{y} / y)$" + f' {ylabel} [{yunit}]'
+    else:
+        pred = np.asarray(eval_out["yhat"], float)         # (N, n_x), linear space
+        true = np.asarray(eval_out["y_true"], float)       # (N, n_x), linear space
+        residuals = pred - true
+        res_label = r"$\hat{y} - y$" + f' {ylabel} [{yunit}]'
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+
+    for i, (xname, res_k) in enumerate(zip(xnames, residuals.transpose())):
+        finite = res_k[np.isfinite(res_k)]
+        ax.hist(finite, bins=bins, label=xname, linewidth=0.4, histtype='step')
+
+    ax.legend(ncol=4)
+    ax.axvline(0.0, color="k", lw=1.2, ls="--")
+    ax.set_xlabel(res_label)
+    ax.set_yticks([])
+    ax.grid(True, alpha=0.2)
+    ax.legend()
+    fig.tight_layout()
+    return fig, ax
+
 def plot_fit_diff(eval_out, yscale="log", min_ratio=1.0, min_diff=0.0):
     x = eval_out["x"]
     y = eval_out["y_true"]
     yhat = eval_out["yhat"]
     err = eval_out['err']
-    ynames = eval_out.get("ynames", None)
+    xnames = eval_out.get("xnames", None)
 
-    # Use ynames as labels when available (DenseDecoder case)
-    use_ynames = ynames is not None and len(ynames) == len(x)
+    # Use xnames as labels when available (DenseDecoder case)
+    use_xnames = xnames is not None and len(xnames) == len(x)
 
     ncol = len(x)
 
     fig, axes = plt.subplots(2, ncol, figsize=(3.2 * ncol, 6.0), squeeze=False)
 
     for i in range(ncol):
-        if use_ynames:
-            ylabel = ynames[i]
+        if use_xnames:
+            ylabel = xnames[i]
         elif len(eval_out.get("labels", [])) == ncol:
             ylabel = eval_out["labels"][i]
         else:
@@ -210,7 +270,6 @@ def plot_param_corner_scatter(eval_out, param_names=None, max_points=5000):
     cbar = fig.colorbar(sm, ax=axes, fraction=0.02, pad=0.01)
     cbar.set_label("log10(L2 error)")
 
-    fig.tight_layout()
     return fig, axes
 
 

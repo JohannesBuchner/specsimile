@@ -53,7 +53,7 @@ class DatasetWriter:
       /y              (N,Y) float64
       /params         (N,P) float64
       /paramnames     (P,) bytes (utf-8)
-      /ynames         (Y,) bytes (utf-8)   [optional, may be absent]
+      /xnames         (Y,) bytes (utf-8)   [optional, may be absent]
     Attributes:
       num_data_training, N, xlabel, ylabel, xunit, yunit
     """
@@ -65,7 +65,7 @@ class DatasetWriter:
         x,
         paramnames,
         *,
-        ynames=None,
+        xnames=None,
         xlabel: str = "",
         ylabel: str = "",
         xunit=None,
@@ -96,12 +96,12 @@ class DatasetWriter:
         paramnames_b = _as_bytes_array(paramnames)
         self._f.create_dataset("paramnames", data=paramnames_b)
 
-        if ynames is not None:
-            if len(ynames) != len(x):
+        if xnames is not None:
+            if len(xnames) != len(x):
                 raise ValueError(
-                    f"ynames length {len(ynames)} must match x length {len(x)}"
+                    f"xnames length {len(xnames)} must match x length {len(x)}"
                 )
-            self._f.create_dataset("ynames", data=_as_bytes_array(ynames))
+            self._f.create_dataset("xnames", data=_as_bytes_array(xnames))
 
         self._f.attrs["num_data_training"] = self.num_data_training
         self._f.attrs["N"] = self.N
@@ -275,9 +275,9 @@ class DatasetReader:
         self.paramnames = _as_str_list(self._f["paramnames"][()])
         self.x = self._f["x"][()].astype(np.float64)
         self.y = self._f["y"][()].astype(np.float64)
-        self.ynames = (
-            _as_str_list(self._f["ynames"][()])
-            if "ynames" in self._f else None
+        self.xnames = (
+            _as_str_list(self._f["xnames"][()])
+            if "xnames" in self._f else None
         )
 
     def __str__(self) -> str:
@@ -285,7 +285,7 @@ class DatasetReader:
             f"Dataset(filename={self.filename},\n"
             f"xlabel={self.xlabel}, xunit={self.xunit}, x={self.x.min()}..{self.x.max()},\n"
             f"ylabel={self.ylabel}, yunit={self.yunit}, y={self.y.min()}..{self.y.max()},\n"
-            f"ynames={self.ynames},\n"
+            f"xnames={self.xnames},\n"
             f")"
         )
 
