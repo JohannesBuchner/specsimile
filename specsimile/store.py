@@ -283,9 +283,9 @@ class DatasetReader:
     def __str__(self) -> str:
         return (
             f"Dataset(filename={self.filename},\n"
-            f"xlabel={self.xlabel}, xunit={self.xunit}, x={self.x.min()}..{self.x.max()},\n"
-            f"ylabel={self.ylabel}, yunit={self.yunit}, y={self.y.min()}..{self.y.max()},\n"
-            f"xnames={self.xnames},\n"
+            f"    xlabel={self.xlabel}, xunit={self.xunit}, x={self.x.min()}..{self.x.max()},\n"
+            f"    ylabel={self.ylabel}, yunit={self.yunit}, y={self.y.min()}..{self.y.max()},\n"
+            f"    xnames={self.xnames},\n"
             f")"
         )
 

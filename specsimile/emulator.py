@@ -574,6 +574,7 @@ class Emulator:
         self.embed_dim = int(ckpt.get("embed_dim", 16))
         self.context_acti = ckpt.get("context_acti", "ReLU")
         self.dropout = float(ckpt.get('dropout', 0.0))
+        print(self.shape, self.acti, self.dropout)
 
         nin = int(ckpt["nin"])
         nout = int(ckpt["nout"])
@@ -593,6 +594,7 @@ class Emulator:
             self._encoder = MLP(
                 nin=nin, nout=nout, shape=self.shape, acti=self.acti, dropout=self.dropout,
             ).to(self.device).double()
+        print(self._encoder)
         self._encoder.load_state_dict(ckpt["encoder_state"])
         self._encoder.to(self.device).double().eval()
         self._loaded = True
@@ -772,6 +774,7 @@ class Emulator:
         batch_size: int,
         train_split: float = 0.8,
         patience: int = 15,
+        patience_min_loss_difference: float = 1e-4,
         seed: int = 123,
         overwrite: bool = True,
     ) -> str:
@@ -790,13 +793,16 @@ class Emulator:
             p.requires_grad_(False)
 
         norm_info = dec.normalize(Y, P)
+        print("Decoder normalisation:")
         for k, v in norm_info.items():
-            print("  Decoder normalisation:", k, v)
-        latent_dim = int(norm_info.get("latent_dim", 0))
-        if latent_dim <= 0:
-            raise ValueError("decoder.normalize must return positive latent_dim")
+            print(f"  - {k}:")
+            for sk, sv in v.items():
+                print(f"    - {sk}: {sv}")
         if "latent" not in norm_info:
             raise ValueError("decoder.normalize must return norm['latent']")
+        latent_dim = int(norm_info.get("latent", {}).get('dim', 0))
+        if latent_dim <= 0:
+            raise ValueError("decoder.normalize must return positive latent_dim")
 
         Pn = self._apply_norm_params(P, norm_info)
         T = self._target_y_pre(Y, norm_info)
@@ -834,7 +840,7 @@ class Emulator:
                 dropout=self.dropout,
             ).to(self.device).double()
         else:
-            enc = MLP(nin=nin, nout=nout, shape=self.shape, acti=self.acti).to(self.device).double()
+            enc = MLP(nin=nin, nout=nout, shape=self.shape, acti=self.acti, dropout=self.dropout).to(self.device).double()
         opt = torch.optim.Adam(enc.parameters(), lr=lr)
 
         lat = norm_info["latent"]
@@ -869,20 +875,54 @@ class Emulator:
                 Pmin[:n_inf], Pmax[:n_inf], norm_info
             )
 
+        # --- Epoch-0 floor mask: skip samples whose targets are entirely below floor ---
+        # A sample is below the floor when max(T[i]) <= floor[i],
+        # i.e. the entire output is at or below the dynamic-range floor.
+        # Only meaningful when dynamic_range is set.
+        if self.dynamic_range is not None:
+            dr = float(self.dynamic_range)
+            # T is in y_pre space (log10 or linear), shape (ntr,)
+            Ttr_max = Ttr.max(dim=1).values          # (ntr,)
+            floor_tr = Ttr_max - dr                  # (ntr,) per-sample floor in y_pre space
+            # keep samples where at least one output is above the floor
+            above_floor_mask = (Ttr_max > floor_tr)  # always True if no func_floor_loss
+            if self.func_floor_loss is not None:
+                abs_floor = float(self.func_floor_loss)
+                floor_tr = torch.clamp(floor_tr, min=abs_floor)
+                above_floor_mask = Ttr.max(dim=1).values > floor_tr
+            ep0_tr_idx = torch.where(above_floor_mask)[0]  # indices into Xtr/Ttr
+        else:
+            ep0_tr_idx = None  # use all samples
+
         best = np.inf
         best_state = None
         bad = 0
 
         for ep in range(int(epochs)):
             enc.train()
+            # Initialisation is difficult when many samples are below the floor and give loss=0.
+            # --> in epoch 0, restrict to samples above the floor
+            if ep == 0 and ep0_tr_idx is not None:
+                active_len = len(ep0_tr_idx)
+                perm_base = ep0_tr_idx[rng.permutation(active_len)]
+                if active_len == 0:
+                    raise AssertionError(f"All training samples are below the adopted loss floor (static={self.func_floor_loss}, dynamic={self.dynamic_range}).")
+                if active_len != len(Xtr):
+                    print(f"Warmup using {active_len}/{len(Xtr)} samples above floor")
+            else:
+                active_len = len(Xtr)
+                perm_base = None
             perm = rng.permutation(len(Xtr))
             if self.smooth_weight > 0.0:
                 rand_normal = torch.randn(len(Xtr), n_inf, dtype=Xtr.dtype, device=Xtr.device)
                 rand_normal = rand_normal / (rand_normal.norm(dim=1, keepdim=True) + 1e-30)
                 rand_normal_va = torch.randn(len(Xva), n_inf, dtype=Xva.dtype, device=Xva.device)
                 rand_normal_va = rand_normal_va / (rand_normal_va.norm(dim=1, keepdim=True) + 1e-30)
-            for i0 in range(0, len(Xtr), batch_size):
-                sl = perm[i0: i0 + batch_size]
+            for i0 in range(0, active_len, batch_size):
+                if perm_base is not None:
+                    sl = perm_base[i0: i0 + batch_size]
+                else:
+                    sl = perm[i0: i0 + batch_size]
                 xb = Xtr[sl]
                 tb = Ttr[sl]
 
@@ -953,7 +993,7 @@ class Emulator:
                 vtotal = vloss
                 loss_str = f"MSE={vloss:.3f}"
 
-            if vtotal < best - 1e-4:
+            if vtotal < best - patience_min_loss_difference:
                 best = vtotal
                 best_state = {
                     k: v.detach().cpu().clone()

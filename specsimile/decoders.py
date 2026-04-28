@@ -76,10 +76,9 @@ class DenseDecoder(nn.Module, DecoderConfigMixin):
             raise ValueError("y must be (N,Y), params must be (N,P) with same N")
 
         return {
-            "y": {"log": False, "eps": 1e-30},
             "params": {"log_mask": np.zeros(params.shape[1], bool), "mean": params.mean(axis=0), "std": params.std(axis=0) + 1e-12, "eps": 1e-30},
-            "latent_dim": self.latent_dim,
-            "latent": {"mean": y.mean(axis=0), "std": y.std(axis=0) + 1e-12, "log_mask": np.zeros(self.latent_dim, bool)},
+            "latent": {"dim": self.latent_dim, "mean": y.mean(axis=0), "std": y.std(axis=0) + 1e-12, "log_mask": np.zeros(self.latent_dim, bool)},
+            "y": {"log": False, "eps": 1e-30},
         }
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
@@ -111,10 +110,9 @@ class LogDenseDecoder(DenseDecoder):
 
         ylog = np.log10(np.clip(y, self.eps, None))
         return {
-            "y": {"log": True, "eps": self.eps},
             "params": {"log_mask": np.zeros(params.shape[1], bool), "mean": params.mean(axis=0), "std": params.std(axis=0) + 1e-12, "eps": 1e-30},
-            "latent_dim": self.latent_dim,
-            "latent": {"mean": ylog.mean(axis=0), "std": ylog.std(axis=0) + 1e-12, "log_mask": np.zeros(self.latent_dim, bool)},
+            "latent": {"dim": self.latent_dim, "mean": ylog.mean(axis=0), "std": ylog.std(axis=0) + 1e-12, "log_mask": np.zeros(self.latent_dim, bool)},
+            "y": {"log": True, "eps": self.eps},
         }
 
     def evaluate(self, z: torch.Tensor) -> torch.Tensor:
@@ -177,10 +175,9 @@ class CutoffPLDecoder(nn.Module, _XSetterMixin, DecoderConfigMixin):
         latent_std[0] = float(np.std(amp) + 1e-6)
 
         return {
-            "y": {"log": True, "eps": self.eps},
             "params": {"log_mask": np.zeros(params.shape[1], bool), "mean": params.mean(axis=0), "std": params.std(axis=0) + 1e-12, "eps": 1e-30},
-            "latent_dim": self.latent_dim,
-            "latent": {"mean": latent_mean, "std": latent_std, "log_mask": np.zeros(self.latent_dim, bool)},
+            "latent": {"dim": self.latent_dim, "mean": latent_mean, "std": latent_std, "log_mask": np.zeros(self.latent_dim, bool)},
+            "y": {"log": True, "eps": self.eps},
         }
 
     def latent_to_params(self, z_phys: torch.Tensor):
@@ -276,10 +273,9 @@ class SBPLDecoder(nn.Module, _XSetterMixin, DecoderConfigMixin):
         latent_std[0] = float(np.std(amp) + 1e-6)
 
         return {
-            "y": {"log": True, "eps": self.eps},
             "params": {"log_mask": np.zeros(params.shape[1], bool), "mean": params.mean(axis=0), "std": params.std(axis=0) + 1e-12, "eps": 1e-30},
-            "latent_dim": self.latent_dim,
-            "latent": {"mean": latent_mean, "std": latent_std, "log_mask": np.zeros(self.latent_dim, bool)},
+            "latent": {"dim": self.latent_dim, "mean": latent_mean, "std": latent_std, "log_mask": np.zeros(self.latent_dim, bool)},
+            "y": {"log": True, "eps": self.eps},
         }
 
     def latent_to_params(self, z_phys: torch.Tensor):
@@ -388,10 +384,9 @@ class QuadraticDecoder(nn.Module, _XSetterMixin, DecoderConfigMixin):
         latent_std[0] = float(np.std(amp) + 1e-6)
 
         return {
-            "y": {"log": True, "eps": self.eps},
             "params": {"log_mask": np.zeros(params.shape[1], bool), "mean": params.mean(axis=0), "std": params.std(axis=0) + 1e-12, "eps": 1e-30},
-            "latent_dim": self.latent_dim,
-            "latent": {"mean": latent_mean, "std": latent_std, "log_mask": np.zeros(self.latent_dim, bool)},
+            "latent": {"dim": self.latent_dim, "mean": latent_mean, "std": latent_std, "log_mask": np.zeros(self.latent_dim, bool)},
+            "y": {"log": True, "eps": self.eps},
         }
 
     def latent_to_params(self, z_phys: torch.Tensor):
