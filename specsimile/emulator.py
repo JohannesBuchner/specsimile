@@ -574,7 +574,6 @@ class Emulator:
         self.embed_dim = int(ckpt.get("embed_dim", 16))
         self.context_acti = ckpt.get("context_acti", "ReLU")
         self.dropout = float(ckpt.get('dropout', 0.0))
-        print(self.shape, self.acti, self.dropout)
 
         nin = int(ckpt["nin"])
         nout = int(ckpt["nout"])
@@ -594,7 +593,8 @@ class Emulator:
             self._encoder = MLP(
                 nin=nin, nout=nout, shape=self.shape, acti=self.acti, dropout=self.dropout,
             ).to(self.device).double()
-        print(self._encoder)
+        if verbose:
+            print("Loaded:", self._encoder)
         self._encoder.load_state_dict(ckpt["encoder_state"])
         self._encoder.to(self.device).double().eval()
         self._loaded = True
