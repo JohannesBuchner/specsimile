@@ -593,11 +593,11 @@ class Emulator:
             self._encoder = MLP(
                 nin=nin, nout=nout, shape=self.shape, acti=self.acti, dropout=self.dropout,
             ).to(self.device).double()
-        if verbose:
-            print("Loaded:", self._encoder)
         self._encoder.load_state_dict(ckpt["encoder_state"])
         self._encoder.to(self.device).double().eval()
         self._loaded = True
+        if verbose:
+            print("Loaded:", self._encoder)
         return self._loaded
 
     def _save(
