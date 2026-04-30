@@ -87,8 +87,22 @@ class LeakySoftplus(nn.Module):
         sp = F.softplus(x, beta=self.beta) - self.zero
         return sp + self.negative_slope * x
 
-def getacti(actiname):
-    """Return the activation function class for a string name."""
+
+def getacti(actiname: str) -> type[nn.Module]:
+    """Return the activation function class for a string name.
+
+    Parameters
+    ----------
+    actiname : str
+        Name of the activation function. Either ``'LeakySoftplus'`` for the
+        custom activation defined in this module, or any attribute name that
+        exists on ``torch.nn`` (e.g. ``'LeakyReLU'``, ``'Tanh'``, ``'ReLU'``).
+
+    Returns
+    -------
+    type[nn.Module]
+        Uninstantiated activation class corresponding to ``actiname``.
+    """
     if actiname == 'LeakySoftplus':
         return LeakySoftplus
     else:
@@ -96,8 +110,31 @@ def getacti(actiname):
 
 
 class MLP(nn.Module):
-    def __init__(self, nin: int, nout: int, shape: list[int],
-                 acti='LeakyReLU', dropout: float = 0.0):
+    def __init__(
+        self,
+        nin: int,
+        nout: int,
+        shape: list[int],
+        acti: str = 'LeakyReLU',
+        dropout: float = 0.0,
+    ):
+        """Construct a multi-layer perceptron.
+
+        Parameters
+        ----------
+        nin : int
+            Number of input features.
+        nout : int
+            Number of output features.
+        shape : list[int]
+            Width of each hidden layer. ``len(shape)`` determines the depth.
+        acti : str, optional
+            Activation function name understood by :func:`getacti`.
+            Default is ``'LeakyReLU'``.
+        dropout : float, optional
+            Dropout probability applied after each hidden activation.
+            ``0.0`` disables dropout. Default is ``0.0``.
+        """
         super().__init__()
         self.acti = acti
         layers = []
@@ -110,7 +147,19 @@ class MLP(nn.Module):
         layers += [nn.Linear(prev, nout)]
         self.net = nn.Sequential(*layers)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Pass input through the MLP.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input tensor of shape ``(B, nin)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Output tensor of shape ``(B, nout)``.
+        """
         return self.net(x)
 
 
@@ -137,6 +186,29 @@ class ConditionalMLP(nn.Module):
         context_acti: str = 'LeakyReLU',
         dropout: float = 0.0,
     ):
+        """Construct a conditional MLP with separate context and inference streams.
+
+        Parameters
+        ----------
+        n_context : int
+            Number of context (fixed) input features.
+        n_inference : int
+            Number of inference (gradient-requiring) input features.
+        nout : int
+            Number of output features.
+        shape : list[int]
+            Hidden-layer widths shared by the main network. The first entry
+            is also used as the single hidden layer of the context encoder.
+        embed_dim : int, optional
+            Dimensionality of the context embedding vector. Default is ``16``.
+        acti : str, optional
+            Activation for the main network. Default is ``'Tanh'``.
+        context_acti : str, optional
+            Activation for the context encoder. Default is ``'LeakyReLU'``.
+        dropout : float, optional
+            Dropout probability in the main network. ``0.0`` disables it.
+            Default is ``0.0``.
+        """
         super().__init__()
         self.n_context = n_context
         self.n_inference = n_inference
@@ -166,6 +238,19 @@ class ConditionalMLP(nn.Module):
         self.main_net = nn.Sequential(*main_layers)
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Pass input through the conditional MLP.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Combined input tensor of shape ``(B, n_inference + n_context)``.
+            The last ``n_context`` columns are treated as context features.
+
+        Returns
+        -------
+        torch.Tensor
+            Output tensor of shape ``(B, nout)``.
+        """
         # x: (B, n_inference, n_context)
         ctx = x[:, -self.n_context:]
         theta = x[:, :-self.n_context]
@@ -174,17 +259,64 @@ class ConditionalMLP(nn.Module):
         return self.main_net(combined)
 
 
-def softplus_np(z):
+def softplus_np(z: np.ndarray | float) -> np.ndarray:
+    """Numerically stable softplus for NumPy arrays.
+
+    Parameters
+    ----------
+    z : array_like
+        Input values. Converted to ``float64`` internally.
+
+    Returns
+    -------
+    np.ndarray
+        Element-wise ``log(1 + exp(z))``, computed in a numerically stable way.
+    """
     z = np.asarray(z, dtype=np.float64)
     return np.log1p(np.exp(-np.abs(z))) + np.maximum(z, 0.0)
 
 
-def soft_floor_np(x, floor, k=10.0):
+def soft_floor_np(x: np.ndarray, floor: np.ndarray | float, k: float = 10.0) -> np.ndarray:
+    """Differentiable soft lower-bound applied element-wise (NumPy).
+
+    Parameters
+    ----------
+    x : np.ndarray
+        Input array.
+    floor : np.ndarray or float
+        Lower bound value(s), broadcast-compatible with ``x``.
+    k : float, optional
+        Sharpness of the soft floor. Larger values make the transition
+        sharper. Default is ``10.0``.
+
+    Returns
+    -------
+    np.ndarray
+        Array of the same shape as ``x`` with values softly clamped from
+        below by ``floor``.
+    """
     z = k * (x - floor)
     return floor + softplus_np(z) / k
 
 
-def soft_floor_torch(x, floor, k=10.0):
+def soft_floor_torch(x: torch.Tensor, floor: torch.Tensor | float, k: float = 10.0) -> torch.Tensor:
+    """Differentiable soft lower-bound applied element-wise (PyTorch).
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        Input tensor.
+    floor : torch.Tensor or float
+        Lower bound value(s), broadcast-compatible with ``x``.
+    k : float, optional
+        Sharpness of the soft floor. Default is ``10.0``.
+
+    Returns
+    -------
+    torch.Tensor
+        Tensor of the same shape as ``x`` with values softly clamped from
+        below by ``floor``.
+    """
     return floor + torch.nn.functional.softplus(k * (x - floor)) / k
 
 
@@ -192,17 +324,17 @@ class Emulator:
     def __init__(
         self,
         model_path: str,
-        decoder,
+        decoder: nn.Module,
         shape: list[int],
         acti: str = "LeakyReLU",
         n_context_params: int = 0,
         embed_dim: int = 16,
         context_acti: str = "ReLU",
         *,
-        device=None,
-        dynamic_range=None,
-        func_floor_loss=None,
-        loss_y_weights=None,
+        device: str | torch.device | None = None,
+        dynamic_range: float | None = None,
+        func_floor_loss: float | None = None,
+        loss_y_weights: np.ndarray | None = None,
         param_bounds_policy: str = 'error',
         smooth_weight: float = 0.0,
         smooth_frac: float = 1e-4,
@@ -211,12 +343,47 @@ class Emulator:
         """
         Parameters
         ----------
-        smooth_weight : float
+        model_path : str
+            Path to save or load the emulator checkpoint.
+        decoder : nn.Module
+            Decoder network that maps latent vectors to output spectra/functions.
+        shape : list[int]
+            Hidden-layer widths of the encoder MLP.
+        acti : str, optional
+            Activation function name for the encoder. Default is ``'LeakyReLU'``.
+        n_context_params : int, optional
+            Number of context (fixed) parameters. ``0`` uses a plain MLP.
+            Default is ``0``.
+        embed_dim : int, optional
+            Embedding dimension for the context encoder. Default is ``16``.
+        context_acti : str, optional
+            Activation for the context sub-network. Default is ``'ReLU'``.
+        device : str or torch.device or None, optional
+            Compute device. ``None`` selects CUDA when available. Default is
+            ``None``.
+        dynamic_range : float or None, optional
+            If set, clamp outputs to within ``dynamic_range`` of their
+            per-sample maximum when computing the loss. Default is ``None``.
+        func_floor_loss : float or None, optional
+            Absolute floor value applied on top of the dynamic-range clamp.
+            Default is ``None``.
+        loss_y_weights : np.ndarray or None, optional
+            Per-output loss weights of shape ``(Y,)``. ``None`` means uniform
+            weighting. Default is ``None``.
+        param_bounds_policy : str, optional
+            How to handle out-of-bounds parameters at inference time.
+            ``'error'`` raises ``ValueError``; ``'nan'`` returns NaN rows.
+            Default is ``'error'``.
+        smooth_weight : float, optional
             Weight λ of the finite-difference smoothness penalty relative to
-            the main RMS loss.  0.0 disables the penalty entirely.
-        smooth_frac : float
+            the main RMS loss. ``0.0`` disables the penalty entirely.
+            Default is ``0.0``.
+        smooth_frac : float, optional
             Step size as a fraction of the per-parameter training range
-            (hi - lo).  Default 1e-4 means a step of 0.01 % of the range.
+            ``(hi - lo)``. Default ``1e-4`` means a step of 0.01 % of the
+            range.
+        dropout : float, optional
+            Dropout probability in the encoder. Default is ``0``.
         """
         self.model_path = str(model_path)
         self.decoder = decoder
@@ -263,7 +430,23 @@ class Emulator:
 
     # ---------- helpers ----------
 
-    def _y_mean_std(self, norm: dict, y_dim: int):
+    def _y_mean_std(self, norm: dict, y_dim: int) -> tuple[np.ndarray, np.ndarray]:
+        """Extract y normalisation mean and std from norm dict.
+
+        Parameters
+        ----------
+        norm : dict
+            Normalisation dictionary as returned by ``decoder.normalize()``.
+        y_dim : int
+            Number of output dimensions; used to set default shapes.
+
+        Returns
+        -------
+        mean : np.ndarray
+            Per-output mean, shape ``(y_dim,)``.
+        std : np.ndarray
+            Per-output standard deviation, shape ``(y_dim,)``.
+        """
         yinfo = norm.get("y", {})
         mean = yinfo.get("mean", None)
         std = yinfo.get("std", None)
@@ -277,7 +460,20 @@ class Emulator:
         )
         return mean, std
 
-    def inside_param_bounds(self, P: np.ndarray):
+    def inside_param_bounds(self, P: np.ndarray) -> np.ndarray:
+        """Return a boolean mask indicating which rows of P are within training bounds.
+
+        Parameters
+        ----------
+        P : np.ndarray
+            Parameter array of shape ``(N, n_params)``.
+
+        Returns
+        -------
+        np.ndarray
+            Boolean array of shape ``(N,)``. ``True`` where all parameters
+            of the row lie within the stored training bounds (plus tolerance).
+        """
         b = self.train_param_bounds
         if b is None or self.param_bounds_tol < 0:
             return
@@ -290,7 +486,20 @@ class Emulator:
             axis=1,
         )
 
-    def _check_param_bounds(self, P: np.ndarray):
+    def _check_param_bounds(self, P: np.ndarray) -> None:
+        """Raise ``ValueError`` if any row of P violates training bounds.
+
+        Parameters
+        ----------
+        P : np.ndarray
+            Parameter array of shape ``(N, n_params)``.
+
+        Returns
+        -------
+        None
+            Returns ``None`` silently when all rows are within bounds or when
+            ``param_bounds_policy != 'error'``.
+        """
         b = self.train_param_bounds
         if b is None or self.param_bounds_tol < 0 or self.param_bounds_policy != 'error':
             return
@@ -321,18 +530,68 @@ class Emulator:
             )
 
     def _apply_norm_params(self, P: np.ndarray, norm: dict) -> np.ndarray:
+        """Normalise raw parameter array using stored statistics.
+
+        Parameters
+        ----------
+        P : np.ndarray
+            Raw parameter array of shape ``(N, n_params)``.
+        norm : dict
+            Normalisation dictionary containing a ``'params'`` sub-dict with
+            keys ``'mean'``, ``'std'``, and optionally ``'log_mask'`` and
+            ``'eps'``.
+
+        Returns
+        -------
+        np.ndarray
+            Normalised parameter array of shape ``(N, n_params)``.
+        """
         pn = norm["params"]
         if "log_mask" in pn:
             P = utils.apply_log_mask(P, pn["log_mask"], pn.get("eps", 1e-30))
         return utils.normalize(P, pn["mean"], pn["std"])
 
     def _apply_latent_norm_inv(self, z_norm: np.ndarray, norm: dict) -> np.ndarray:
+        """Invert latent normalisation to recover physical latent vectors.
+
+        Parameters
+        ----------
+        z_norm : np.ndarray
+            Normalised latent array of shape ``(N, latent_dim)``.
+        norm : dict
+            Normalisation dictionary containing a ``'latent'`` sub-dict with
+            optional keys ``'mean'`` and ``'std'``.
+
+        Returns
+        -------
+        np.ndarray
+            Physical latent array of shape ``(N, latent_dim)``.
+        """
         lat = norm["latent"]
         std = np.asarray(lat["std"], np.float64).reshape(1, -1) if "std" in lat else 1.0
         mean = np.asarray(lat["mean"], np.float64).reshape(1, -1) if "mean" in lat else 0.0
         return z_norm * std + mean
 
     def _target_y_pre(self, Y: np.ndarray, norm: dict) -> np.ndarray:
+        """Transform raw targets into the training target space.
+
+        Applies an optional log10 transform and then standardises by the
+        stored y mean and standard deviation.
+
+        Parameters
+        ----------
+        Y : np.ndarray
+            Raw target array of shape ``(N, y_dim)``.
+        norm : dict
+            Normalisation dictionary with a ``'y'`` sub-dict containing at
+            minimum a ``'log'`` flag and optionally ``'eps'``, ``'mean'``,
+            and ``'std'``.
+
+        Returns
+        -------
+        np.ndarray
+            Standardised target array of shape ``(N, y_dim)``.
+        """
         if bool(norm["y"].get("log", False)):
             eps = float(norm["y"].get("eps", 1e-30))
             Ypre = np.log10(np.clip(Y, eps, None))
@@ -341,22 +600,30 @@ class Emulator:
         mean, std = self._y_mean_std(norm, Ypre.shape[1])
         return (Ypre - mean[None, :]) / std[None, :]
 
-    def _build_smooth_step(self, Pmin_inf, Pmax_inf, norm):
-        """
-        Build per-parameter step sizes in *normalised* input space.
+    def _build_smooth_step(
+        self,
+        Pmin_inf: np.ndarray,
+        Pmax_inf: np.ndarray,
+        norm: dict,
+    ) -> torch.Tensor:
+        """Build per-parameter step sizes in *normalised* input space.
 
         Parameters
         ----------
-        Pmin_inf, Pmax_inf : (n_inf,) arrays
-            Physical min/max of the inference parameters only
-            (context params excluded).
+        Pmin_inf : np.ndarray
+            Physical minimum of the inference parameters only (context params
+            excluded). Shape ``(n_inf,)``.
+        Pmax_inf : np.ndarray
+            Physical maximum of the inference parameters only. Shape
+            ``(n_inf,)``.
         norm : dict
-            Normalisation info from decoder.normalize().
+            Normalisation info from ``decoder.normalize()``.
 
         Returns
         -------
-        torch.Tensor, shape (1, n_inf)
-            Step size for each inference parameter in normalised space.
+        torch.Tensor
+            Step size for each inference parameter in normalised space, shape
+            ``(1, n_inf)``.
         """
         pn = norm["params"]
         std_norm = np.asarray(pn["std"], dtype=np.float64)
@@ -369,20 +636,52 @@ class Emulator:
         return torch.tensor(
             delta_norm.reshape(1, -1), dtype=torch.float64, device=self.device
         )
+
     def _taylor_consistency_penalty(
-        self, xb, enc, dec, lat_mean, lat_std, y_mean, y_std,
-        direction, *, create_graph: bool = True,
-    ):
-        """
-        Penalise gradients inconsistent with nearby function values.
+        self,
+        xb: torch.Tensor,
+        enc: nn.Module,
+        dec: nn.Module,
+        lat_mean: torch.Tensor | float,
+        lat_std: torch.Tensor | float,
+        y_mean: torch.Tensor,
+        y_std: torch.Tensor,
+        direction: torch.Tensor,
+        *,
+        create_graph: bool = True,
+    ) -> torch.Tensor:
+        """Penalise gradients inconsistent with nearby function values.
 
             residual = f(x + delta) - f(x) - delta · grad_f(x)
 
         Parameters
         ----------
-        create_graph : bool
-            True during training (penalty must be differentiable w.r.t. weights).
-            False during validation (only need the scalar value).
+        xb : torch.Tensor
+            Batch of normalised input parameters, shape ``(B, n_input)``.
+        enc : nn.Module
+            Encoder network mapping normalised params to normalised latents.
+        dec : nn.Module
+            Decoder network mapping physical latents to output spectra.
+        lat_mean : torch.Tensor or float
+            Latent mean used to de-normalise encoder outputs.
+        lat_std : torch.Tensor or float
+            Latent std used to de-normalise encoder outputs.
+        y_mean : torch.Tensor
+            Output mean for standardisation, shape ``(1, y_dim)``.
+        y_std : torch.Tensor
+            Output std for standardisation, shape ``(1, y_dim)``.
+        direction : torch.Tensor
+            Unit-vector perturbation directions in inference-param space,
+            shape ``(B, n_inf)``.
+        create_graph : bool, optional
+            ``True`` during training (penalty must be differentiable w.r.t.
+            weights). ``False`` during validation (only need the scalar
+            value). Default is ``True``.
+
+        Returns
+        -------
+        torch.Tensor
+            Scalar smoothness penalty value.
         """
         B = xb.shape[0]
         n_ctx = self.n_context_params
@@ -401,7 +700,7 @@ class Emulator:
         else:
             delta_full = delta_inf
 
-        def forward_standardized(x_in):
+        def forward_standardized(x_in: torch.Tensor) -> torch.Tensor:
             z_norm = torch.clamp(enc(x_in), -25, 25)
             z_phys = z_norm * lat_std + lat_mean
             y_pre  = dec(z_phys)
@@ -439,13 +738,20 @@ class Emulator:
         return (residual ** 2).mean()
 
     def _gradient_magnitude_penalty(
-        self, xb, enc, dec, lat_mean, lat_std, y_mean, y_std,
-        *, create_graph: bool = True,
-    ):
-        """
-        Penalise large input-gradients at training points.
+        self,
+        xb: torch.Tensor,
+        enc: nn.Module,
+        dec: nn.Module,
+        lat_mean: torch.Tensor | float,
+        lat_std: torch.Tensor | float,
+        y_mean: torch.Tensor,
+        y_std: torch.Tensor,
+        *,
+        create_graph: bool = True,
+    ) -> torch.Tensor:
+        """Penalise large input-gradients at training points.
 
-        Computes d f(x) / d x_inf (inference dims only) and penalises
+        Computes ``d f(x) / d x_inf`` (inference dims only) and penalises
         its squared magnitude. This directly discourages spikes in the
         learned function at training locations.
 
@@ -453,12 +759,37 @@ class Emulator:
         slope of each active linear piece, pushing the network toward
         shallower, wider pieces — exactly what reduces gradient noise
         seen by HMC.
+
+        Parameters
+        ----------
+        xb : torch.Tensor
+            Batch of normalised input parameters, shape ``(B, n_input)``.
+        enc : nn.Module
+            Encoder network.
+        dec : nn.Module
+            Decoder network.
+        lat_mean : torch.Tensor or float
+            Latent mean for de-normalisation.
+        lat_std : torch.Tensor or float
+            Latent std for de-normalisation.
+        y_mean : torch.Tensor
+            Output mean for standardisation, shape ``(1, y_dim)``.
+        y_std : torch.Tensor
+            Output std for standardisation, shape ``(1, y_dim)``.
+        create_graph : bool, optional
+            Whether to build a differentiable graph through the gradient
+            computation. Default is ``True``.
+
+        Returns
+        -------
+        torch.Tensor
+            Scalar gradient-magnitude penalty.
         """
         B = xb.shape[0]
         n_ctx = self.n_context_params
         n_inf = xb.shape[1] - n_ctx
 
-        def forward_standardized(x_in):
+        def forward_standardized(x_in: torch.Tensor) -> torch.Tensor:
             z_norm = torch.clamp(enc(x_in), -25, 25)
             z_phys = z_norm * lat_std + lat_mean
             y_pre  = dec(z_phys)
@@ -481,8 +812,40 @@ class Emulator:
 
         return (grad_inf ** 2).mean()
 
+    def _gradient_penalty(
+        self,
+        xb: torch.Tensor,
+        enc: nn.Module,
+        dec: nn.Module,
+        lat_mean: torch.Tensor | float,
+        lat_std: torch.Tensor | float,
+        y_mean: torch.Tensor,
+        y_std: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute a random-directional gradient penalty via JVP.
 
-    def _gradient_penalty(self, xb, enc, dec, lat_mean, lat_std, y_mean, y_std):
+        Parameters
+        ----------
+        xb : torch.Tensor
+            Batch of normalised input parameters, shape ``(B, n_input)``.
+        enc : nn.Module
+            Encoder network.
+        dec : nn.Module
+            Decoder network.
+        lat_mean : torch.Tensor or float
+            Latent mean for de-normalisation.
+        lat_std : torch.Tensor or float
+            Latent std for de-normalisation.
+        y_mean : torch.Tensor
+            Output mean for standardisation, shape ``(1, y_dim)``.
+        y_std : torch.Tensor
+            Output std for standardisation, shape ``(1, y_dim)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Scalar penalty (zero when ``smooth_weight == 0``).
+        """
         if self.smooth_weight == 0.0:
             return xb.new_tensor(0.0)
 
@@ -497,7 +860,7 @@ class Emulator:
         v = torch.randn(B, n_inf, dtype=xb.dtype, device=xb.device)
         v = v / (v.norm(dim=1, keepdim=True) + 1e-30)   # (B, n_inf)
 
-        def forward_fn(x_inf_single, x_ctx_single):
+        def forward_fn(x_inf_single: torch.Tensor, x_ctx_single: torch.Tensor | None) -> torch.Tensor:
             if n_ctx > 0:
                 x_full = torch.cat([
                     x_inf_single.unsqueeze(0),
@@ -529,7 +892,20 @@ class Emulator:
 
     # ---------- checkpoint IO ----------
 
-    def load(self, verbose: bool = True):
+    def load(self, verbose: bool = True) -> bool:
+        """Load encoder weights and metadata from the checkpoint file.
+
+        Parameters
+        ----------
+        verbose : bool, optional
+            Print checkpoint metadata and architecture summary when ``True``.
+            Default is ``True``.
+
+        Returns
+        -------
+        bool
+            ``True`` when the checkpoint was loaded successfully.
+        """
         if not os.path.exists(self.model_path):
             raise FileNotFoundError(self.model_path)
 
@@ -609,7 +985,28 @@ class Emulator:
         nout: int,
         meta: dict,
         fit_stats: dict,
-    ):
+    ) -> None:
+        """Serialise the encoder and all metadata to ``self.model_path``.
+
+        Parameters
+        ----------
+        norm : dict
+            Normalisation dictionary as returned by ``decoder.normalize()``.
+        encoder : nn.Module
+            Trained encoder network whose ``state_dict`` will be saved.
+        nin : int
+            Number of encoder input features.
+        nout : int
+            Number of encoder output features (latent dimension).
+        meta : dict
+            Metadata dict (parameter names, decoder info, bounds, …).
+        fit_stats : dict
+            Dict containing ``fit_mean``, ``fit_median``, and ``fit_p95``.
+
+        Returns
+        -------
+        None
+        """
         ckpt = dict(
             shape=self.shape,
             acti=self.acti,
@@ -627,6 +1024,22 @@ class Emulator:
         torch.save(ckpt, self.model_path)
 
     def _arch_string(self, xgrid: np.ndarray, P: np.ndarray, Y: np.ndarray) -> str:
+        """Return a human-readable architecture summary string.
+
+        Parameters
+        ----------
+        xgrid : np.ndarray
+            Grid of x values (used only for shape info, not values).
+        P : np.ndarray
+            Parameter array, shape ``(N, n_params)``.
+        Y : np.ndarray
+            Target array, shape ``(N, y_dim)``.
+
+        Returns
+        -------
+        str
+            A compact string describing the encoder/decoder architecture.
+        """
         in_dim = int(P.shape[1])
         ydim = int(Y.shape[1])
         enc_str = "-".join(str(w) for w in self.shape)
@@ -646,12 +1059,23 @@ class Emulator:
     # ---------- loss weighting ----------
 
     def _loss_variance_torch(self, y: torch.Tensor) -> torch.Tensor:
-        """
-        Return per-sample, per-point sigma in y_pre space, shape (B, D).
+        """Return per-sample, per-point variance weights in y_pre space.
 
-        dynamic_range: sigma_dyn = max(y) - dynamic_range   (broadcast to (B,D))
-        func_floor_loss: sigma_func = constant
-        If both given: sigma^2 = sigma_dyn^2 + sigma_func^2  (quadrature)
+        Parameters
+        ----------
+        y : torch.Tensor
+            Target tensor in y_pre space, shape ``(B, D)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Variance tensor of shape ``(B, D)``.
+
+            * ``dynamic_range`` set: ``sigma_dyn = max(y) - dynamic_range``
+              (broadcast over D).
+            * ``func_floor_loss`` set: ``sigma_func = constant``.
+            * Both set: combined in quadrature.
+            * Neither set: returns all-ones (uniform weighting).
         """
         B, D = y.shape
         sig2 = None
@@ -676,8 +1100,18 @@ class Emulator:
         return sig2.expand(B, D)
 
     def _loss_variance_np(self, y: np.ndarray) -> np.ndarray:
-        """
-        Numpy version of _loss_variance_torch. Returns (N,D).
+        """Return per-sample, per-point variance weights in y_pre space (NumPy).
+
+        Parameters
+        ----------
+        y : np.ndarray
+            Target array in y_pre space, shape ``(N, D)``.
+
+        Returns
+        -------
+        np.ndarray
+            Variance array of shape ``(N, D)``. See :meth:`_loss_variance_torch`
+            for the computation rules.
         """
         y = np.asarray(y, dtype=np.float64)
         N, D = y.shape
@@ -700,9 +1134,24 @@ class Emulator:
 
         return np.repeat(sig2, D, axis=1)  # (N,D)
 
-    def _apply_dynamic_range_torch(self, yhat: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Apply dynamic-range clamping in the *same space* as yhat,y (y_pre space).
+    def _apply_dynamic_range_torch(
+        self, yhat: torch.Tensor, y: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply dynamic-range clamping in y_pre space (PyTorch).
+
+        Parameters
+        ----------
+        yhat : torch.Tensor
+            Predicted values in y_pre space, shape ``(B, D)``.
+        y : torch.Tensor
+            Target values in y_pre space, shape ``(B, D)``.
+
+        Returns
+        -------
+        yhat_clamped : torch.Tensor
+            Soft-floored predictions, shape ``(B, D)``.
+        y_clamped : torch.Tensor
+            Soft-floored targets, shape ``(B, D)``.
         """
         if self.dynamic_range is None:
             return yhat, y
@@ -718,8 +1167,21 @@ class Emulator:
     def _apply_dynamic_range_np(
         self, yhat: np.ndarray, y: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray]:
-        """
-        Apply dynamic-range clamping in y_pre space (numpy).
+        """Apply dynamic-range clamping in y_pre space (NumPy).
+
+        Parameters
+        ----------
+        yhat : np.ndarray
+            Predicted values in y_pre space, shape ``(N, D)``.
+        y : np.ndarray
+            Target values in y_pre space, shape ``(N, D)``.
+
+        Returns
+        -------
+        yhat_clamped : np.ndarray
+            Soft-floored predictions, shape ``(N, D)``.
+        y_clamped : np.ndarray
+            Soft-floored targets, shape ``(N, D)``.
         """
         if self.dynamic_range is None:
             return yhat, y
@@ -735,8 +1197,22 @@ class Emulator:
     def rms_per_sample_torch(
         self, yhat: torch.Tensor, y: torch.Tensor
     ) -> torch.Tensor:
-        """
-        Returns (B,) RMS in y_pre space, with dynamic-range clamp applied if configured.
+        """Compute per-sample RMS error in y_pre space (PyTorch).
+
+        Applies dynamic-range clamping before computing the error when
+        ``dynamic_range`` is configured.
+
+        Parameters
+        ----------
+        yhat : torch.Tensor
+            Predicted values in y_pre space, shape ``(B, D)``.
+        y : torch.Tensor
+            Target values in y_pre space, shape ``(B, D)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Per-sample RMS errors, shape ``(B,)``.
         """
         yhat2, y2 = self._apply_dynamic_range_torch(yhat, y)
         return torch.sqrt(
@@ -744,8 +1220,22 @@ class Emulator:
         )
 
     def rms_per_sample_np(self, yhat: np.ndarray, y: np.ndarray) -> np.ndarray:
-        """
-        Returns (N,) RMS in y_pre space, with dynamic-range clamp applied if configured.
+        """Compute per-sample RMS error in y_pre space (NumPy).
+
+        Applies dynamic-range clamping before computing the error when
+        ``dynamic_range`` is configured.
+
+        Parameters
+        ----------
+        yhat : np.ndarray
+            Predicted values in y_pre space, shape ``(N, D)``.
+        y : np.ndarray
+            Target values in y_pre space, shape ``(N, D)``.
+
+        Returns
+        -------
+        np.ndarray
+            Per-sample RMS errors, shape ``(N,)``.
         """
         yhat2, y2 = self._apply_dynamic_range_np(
             np.asarray(yhat), np.asarray(y)
@@ -755,11 +1245,22 @@ class Emulator:
         )
 
     def loss_fn(self, yhat: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        """
-        yhat, y: (B, D) in the *training target space* (usually log10(y) or y_pre).
-        dynamic_range:
-          - if None: plain MSE
-          - else: clamp both yhat and y to at least (per-sample max - dynamic_range)
+        """Compute the mean RMS loss over a batch.
+
+        Parameters
+        ----------
+        yhat : torch.Tensor
+            Predicted values in the training target space (y_pre), shape
+            ``(B, D)``.
+        y : torch.Tensor
+            Target values in the training target space (y_pre), shape
+            ``(B, D)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Scalar mean RMS loss. When ``dynamic_range`` is ``None``, this
+            reduces to the plain root-mean-square error.
         """
         return self.rms_per_sample_torch(yhat, y).mean()
 
@@ -778,6 +1279,36 @@ class Emulator:
         seed: int = 123,
         overwrite: bool = True,
     ) -> str:
+        """Train the encoder and save the checkpoint.
+
+        Parameters
+        ----------
+        dataset : DatasetReader
+            Training dataset providing ``params``, ``y``, ``x``, and metadata.
+        epochs : int
+            Maximum number of training epochs.
+        lr : float
+            Adam learning rate.
+        batch_size : int
+            Mini-batch size.
+        train_split : float, optional
+            Fraction of data used for training. Default is ``0.8``.
+        patience : int, optional
+            Early-stopping patience in epochs. Default is ``15``.
+        patience_min_loss_difference : float, optional
+            Minimum improvement in validation loss to reset patience counter.
+            Default is ``1e-4``.
+        seed : int, optional
+            Random seed for train/validation split and batch shuffling.
+            Default is ``123``.
+        overwrite : bool, optional
+            Ignored (kept for API compatibility). Default is ``True``.
+
+        Returns
+        -------
+        str
+            Path to the saved checkpoint file (``self.model_path``).
+        """
         Y = dataset.y.astype(np.float64)
         P = dataset.params.astype(np.float64)
         Pmin = P.min(axis=0)
@@ -1075,12 +1606,38 @@ class Emulator:
 
     def transform(
         self,
-        params,
+        params: np.ndarray,
         *,
-        x=None,
+        x: np.ndarray | None = None,
         dataset: DatasetReader | None = None,
         return_latent_params: bool = True,
-    ):
+    ) -> np.ndarray:
+        """Map input parameters to emulator outputs or latent vectors.
+
+        Parameters
+        ----------
+        params : np.ndarray
+            Parameter array of shape ``(N, n_params)`` or ``(n_params,)``
+            for a single sample (squeezed automatically).
+        x : np.ndarray or None, optional
+            Override the decoder's x grid. Mutually exclusive with
+            ``return_latent_params=True``. Default is ``None``.
+        dataset : DatasetReader or None, optional
+            If given, sets the decoder's x grid from ``dataset.x``.
+            Mutually exclusive with ``return_latent_params=True``.
+            Default is ``None``.
+        return_latent_params : bool, optional
+            When ``True`` (and no ``x`` or ``dataset`` is given), returns
+            latent parameters instead of decoded outputs. Default is ``True``.
+
+        Returns
+        -------
+        np.ndarray
+            * If ``return_latent_params=True``: latent array, shape
+              ``(N, latent_dim)`` or ``(latent_dim,)`` for a single sample.
+            * Otherwise: decoded output array, shape ``(N, y_dim)`` or
+              ``(y_dim,)`` for a single sample.
+        """
         # set decoder x from dataset unless user overrides x
         if return_latent_params:
             if x is not None:
@@ -1133,19 +1690,22 @@ class Emulator:
         return y[0] if squeeze else y
 
     def to_dict(self, y: np.ndarray) -> dict[str, np.ndarray]:
-        """
-        Convert a y array (N, Y) or (Y,) into a dict keyed by xnames.
+        """Convert a y array into a dict keyed by xnames.
 
         Requires that xnames were stored during training (i.e. the dataset
         had a xnames column).  Raises RuntimeError if xnames are unavailable.
 
         Parameters
         ----------
-        y : (Y,) or (N, Y) float array as returned by transform() or evaluate()
+        y : np.ndarray
+            Output array of shape ``(Y,)`` or ``(N, Y)`` as returned by
+            :meth:`transform` or :meth:`evaluate`.
 
         Returns
         -------
-        dict mapping each output name to its column, shape (N,) or scalar.
+        dict[str, np.ndarray]
+            Mapping from each output name (from ``self.xnames``) to its
+            column, shape ``(N,)`` or scalar when ``y`` was 1-D.
         """
         if self.xnames is None:
             raise RuntimeError(
@@ -1171,10 +1731,67 @@ class Emulator:
         self,
         dataset: DatasetReader,
         *,
-        nmax=None,
+        nmax: int | None = None,
         seed: int = 123,
         return_decoded_params: bool = True,
-    ):
+    ) -> dict:
+        """Run the emulator on a dataset and return predictions and diagnostics.
+
+        Parameters
+        ----------
+        dataset : DatasetReader
+            Dataset providing ``params``, ``y``, ``x``, and metadata.
+        nmax : int or None, optional
+            If given, randomly sub-sample at most ``nmax`` rows from the
+            dataset before evaluation. Default is ``None`` (use all rows).
+        seed : int, optional
+            Random seed for sub-sampling when ``nmax`` is set.
+            Default is ``123``.
+        return_decoded_params : bool, optional
+            When ``True`` and the decoder exposes a ``latent_to_params``
+            method, include decoded physical parameters in the output dict.
+            Default is ``True``.
+
+        Returns
+        -------
+        dict
+            Dictionary with the following keys:
+
+            idx : np.ndarray
+                Row indices from the original dataset that were evaluated.
+            x : np.ndarray
+                The x grid used by the decoder.
+            params : np.ndarray
+                Evaluated parameter rows, shape ``(N, n_params)``.
+            y_true : np.ndarray
+                True output values, shape ``(N, y_dim)``.
+            yhat : np.ndarray
+                Predicted output values in physical space, shape
+                ``(N, y_dim)``.
+            y_pre_true : np.ndarray
+                True outputs in y_pre space (log10 or linear).
+            y_pre_hat : np.ndarray
+                Predicted outputs in y_pre space.
+            err : np.ndarray
+                Per-sample RMS error in y_pre space, shape ``(N,)``.
+            z_norm : np.ndarray
+                Normalised latent vectors, shape ``(N, latent_dim)``.
+            z_phys : np.ndarray
+                Physical latent vectors, shape ``(N, latent_dim)``.
+            dec_params : np.ndarray or None
+                Decoded physical parameters from the latent space, or
+                ``None`` when unavailable.
+            xnames : list[str] or None
+                Output names stored in the emulator.
+            xlabel : str
+                x-axis label from the dataset.
+            ylabel : str
+                y-axis label from the dataset.
+            xunit : str
+                x-axis unit from the dataset.
+            yunit : str
+                y-axis unit from the dataset.
+        """
         P = dataset.params.astype(np.float64)
         Y = dataset.y.astype(np.float64)
         xgrid = dataset.x.astype(np.float64)

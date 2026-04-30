@@ -1,5 +1,5 @@
 """Functions for using the emulators from jax """
-from typing import Dict
+from typing import Dict, List, Union
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -12,9 +12,23 @@ import torch
 # Part 2: Extract weights from PyTorch emulator models (specsimile)
 # ============================================================================
 
-def extract_pytorch_emulator_weights(model_path: str, verbose: bool=True) -> Dict[str, np.ndarray]:
+def extract_pytorch_emulator_weights(model_path: str, verbose: bool = True) -> Dict[str, np.ndarray]:
     """
     Extract weights from a specsimile Emulator saved as a PyTorch checkpoint.
+
+    Parameters
+    ----------
+    model_path : str
+        Path to the PyTorch .pt checkpoint file.
+    verbose : bool, optional
+        If True, print diagnostic information about the loaded checkpoint.
+        Default is True.
+
+    Returns
+    -------
+    result : dict of str to np.ndarray
+        Dictionary mapping parameter names to numpy arrays, plus metadata
+        entries (e.g. '_norm', 'decoder_type', 'paramnames', etc.).
     """
     checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
     result = {}
@@ -76,7 +90,7 @@ def extract_pytorch_emulator_weights(model_path: str, verbose: bool=True) -> Dic
     
     return result
 
-def jax_encoder_forward(x, bundle, prefix):
+def jax_encoder_forward(x: jnp.ndarray, bundle: dict, prefix: str) -> jnp.ndarray:
     """
     Forward pass through a specsimile encoder stored in *bundle* under *prefix*.
 
@@ -84,7 +98,8 @@ def jax_encoder_forward(x, bundle, prefix):
 
     Parameters
     ----------
-    x : jnp.ndarray, shape (N, n_inputs)
+    x : jnp.ndarray
+        Input array of shape (N, n_inputs).
     bundle : dict
         Parameter bundle as returned by :func:`load_decoder_bundle`.
     prefix : str
@@ -92,8 +107,8 @@ def jax_encoder_forward(x, bundle, prefix):
 
     Returns
     -------
-    h : jnp.ndarray, shape (N, latent_dim)
-        Denormalised latent / decoder parameters.
+    h : jnp.ndarray
+        Denormalised latent / decoder parameters of shape (N, latent_dim).
     """
     p = f'{prefix}_' if prefix else ''
     h = x
@@ -148,20 +163,58 @@ def jax_encoder_forward(x, bundle, prefix):
 
     return h
 
-def _jax_sigmoid_asinh(x, lo, hi):
-    """JAX version of specsimile sigmoid_asinh: R -> (lo, hi)."""
+def _jax_sigmoid_asinh(x: jnp.ndarray, lo: float, hi: float) -> jnp.ndarray:
+    """
+    JAX version of specsimile sigmoid_asinh: R -> (lo, hi).
+
+    Parameters
+    ----------
+    x : jnp.ndarray
+        Input array of arbitrary shape.
+    lo : float
+        Lower bound of the output range.
+    hi : float
+        Upper bound of the output range.
+
+    Returns
+    -------
+    jnp.ndarray
+        Transformed array of the same shape as *x*, with values in (lo, hi).
+    """
     spread = hi - lo
     mid = (lo + hi) / 2.0
     return mid + (spread / 4.0) * jnp.arcsinh(x)
 
 
-def _jax_cutoffpl_latent_to_params(z_phys, gamma_lo=0.5, gamma_hi=6.0,
-                                     logxcut_lo=-1.0, logxcut_hi=6.0):
+def _jax_cutoffpl_latent_to_params(
+    z_phys: jnp.ndarray,
+    gamma_lo: float = 0.5,
+    gamma_hi: float = 6.0,
+    logxcut_lo: float = -1.0,
+    logxcut_hi: float = 6.0,
+) -> jnp.ndarray:
     """
     JAX version of CutoffPLDecoder.latent_to_params.
-    
-    Input z_phys: (N, 3) = [logA, gamma_raw, logxcut_raw]
-    Output: (N, 3) = [logA, gamma, xcut]
+
+    Parameters
+    ----------
+    z_phys : jnp.ndarray
+        Input latent array of shape (N, 3), with columns
+        [logA, gamma_raw, logxcut_raw].
+    gamma_lo : float, optional
+        Lower bound for the photon index gamma. Default is 0.5.
+    gamma_hi : float, optional
+        Upper bound for the photon index gamma. Default is 6.0.
+    logxcut_lo : float, optional
+        Lower bound for log10(xcut). Default is -1.0.
+    logxcut_hi : float, optional
+        Upper bound for log10(xcut). Default is 6.0.
+
+    Returns
+    -------
+    jnp.ndarray
+        Physical parameter array of shape (N, 3) with columns
+        [logA, gamma, xcut].
     """
     logA = z_phys[:, 0]
     gamma = _jax_sigmoid_asinh(z_phys[:, 1], gamma_lo, gamma_hi)
@@ -170,11 +223,36 @@ def _jax_cutoffpl_latent_to_params(z_phys, gamma_lo=0.5, gamma_hi=6.0,
     return jnp.column_stack([logA, gamma, xcut])
 
 
-def _jax_cutoffpl_latent_to_params_warm(z_phys, gamma_lo=0.5, gamma_hi=6.0,
-                                          logxcut_lo=-1.0, logxcut_hi=1.0):
+def _jax_cutoffpl_latent_to_params_warm(
+    z_phys: jnp.ndarray,
+    gamma_lo: float = 0.5,
+    gamma_hi: float = 6.0,
+    logxcut_lo: float = -1.0,
+    logxcut_hi: float = 1.0,
+) -> jnp.ndarray:
     """
     JAX version of CutoffPLDecoder.latent_to_params for warm corona.
-    xcut_lo=1e-1, xcut_hi=10 => logxcut_lo=-1, logxcut_hi=1
+    xcut_lo=1e-1, xcut_hi=10 => logxcut_lo=-1, logxcut_hi=1.
+
+    Parameters
+    ----------
+    z_phys : jnp.ndarray
+        Input latent array of shape (N, 3), with columns
+        [logA, gamma_raw, logxcut_raw].
+    gamma_lo : float, optional
+        Lower bound for the photon index gamma. Default is 0.5.
+    gamma_hi : float, optional
+        Upper bound for the photon index gamma. Default is 6.0.
+    logxcut_lo : float, optional
+        Lower bound for log10(xcut). Default is -1.0.
+    logxcut_hi : float, optional
+        Upper bound for log10(xcut). Default is 1.0.
+
+    Returns
+    -------
+    jnp.ndarray
+        Physical parameter array of shape (N, 3) with columns
+        [logA, gamma, xcut].
     """
     logA = z_phys[:, 0]
     gamma = _jax_sigmoid_asinh(z_phys[:, 1], gamma_lo, gamma_hi)
@@ -183,16 +261,42 @@ def _jax_cutoffpl_latent_to_params_warm(z_phys, gamma_lo=0.5, gamma_hi=6.0,
     return jnp.column_stack([logA, gamma, xcut])
 
 
-def _jax_sbpl_latent_to_params(z_phys, slope_scale=2.5,
-                                 logx_lo=1.0, logx_hi=3.0,
-                                 logw_lo=-1.0, logw_hi=2.0):
+def _jax_sbpl_latent_to_params(
+    z_phys: jnp.ndarray,
+    slope_scale: float = 2.5,
+    logx_lo: float = 1.0,
+    logx_hi: float = 3.0,
+    logw_lo: float = -1.0,
+    logw_hi: float = 2.0,
+) -> jnp.ndarray:
     """
     JAX version of SBPLDecoder.latent_to_params.
-    
-    Input z_phys: (N, 5) = [lognorm, s1_raw, s2_raw, logxbrk_raw, logw_raw]
-    Output: (N, 5) = [lognorm, uvslope, plslope, plbendloc, plbendwidth]
-    
-    Note: duallike.py names these as:
+
+    Parameters
+    ----------
+    z_phys : jnp.ndarray
+        Input latent array of shape (N, 5), with columns
+        [lognorm, s1_raw, s2_raw, logxbrk_raw, logw_raw].
+    slope_scale : float, optional
+        Scaling factor applied to arcsinh-transformed slopes. Default is 2.5.
+    logx_lo : float, optional
+        Lower bound for log10(x_break). Default is 1.0.
+    logx_hi : float, optional
+        Upper bound for log10(x_break). Default is 3.0.
+    logw_lo : float, optional
+        Lower bound for log10(width). Default is -1.0.
+    logw_hi : float, optional
+        Upper bound for log10(width). Default is 2.0.
+
+    Returns
+    -------
+    jnp.ndarray
+        Physical parameter array of shape (N, 5) with columns
+        [lognorm, uvslope, plslope, plbendloc, plbendwidth].
+
+    Notes
+    -----
+    duallike.py names these as:
       lognorm_510, uvslope, plslope, plbendloc, plbendwidth = dec5.transpose()
     where dec5 comes from emu.predict_sbpl_params which calls
     transform(..., return_latent_params=True) -> latent_to_params.
@@ -207,15 +311,39 @@ def _jax_sbpl_latent_to_params(z_phys, slope_scale=2.5,
     return jnp.column_stack([lognorm, s1, s2, xbrk, width])
 
 
-def _jax_quadratic_latent_to_params(z_phys, logx_lo=-1.0, logx_hi=2.0,
-                                      logw_lo=-1.0, logw_hi=1.0):
+def _jax_quadratic_latent_to_params(
+    z_phys: jnp.ndarray,
+    logx_lo: float = -1.0,
+    logx_hi: float = 2.0,
+    logw_lo: float = -1.0,
+    logw_hi: float = 1.0,
+) -> jnp.ndarray:
     """
     JAX version of QuadraticDecoder.latent_to_params.
-    
-    Input z_phys: (N, 3) = [logA, logxpeak_raw, logw_raw]
-    Output: (N, 3) = [logA, xpeak, w]
-    
-    Note: emuloader.py then converts:
+
+    Parameters
+    ----------
+    z_phys : jnp.ndarray
+        Input latent array of shape (N, 3), with columns
+        [logA, logxpeak_raw, logw_raw].
+    logx_lo : float, optional
+        Lower bound for log10(x_peak). Default is -1.0.
+    logx_hi : float, optional
+        Upper bound for log10(x_peak). Default is 2.0.
+    logw_lo : float, optional
+        Lower bound for log10(width). Default is -1.0.
+    logw_hi : float, optional
+        Upper bound for log10(width). Default is 1.0.
+
+    Returns
+    -------
+    jnp.ndarray
+        Physical parameter array of shape (N, 3) with columns
+        [logA, xpeak, w].
+
+    Notes
+    -----
+    emuloader.py then converts:
       out[:, 0] *= ln10    (logA -> lnA)
       out[:, 2] /= sqrt(ln10)  (sigma log10 -> sigma ln)
     """
@@ -237,13 +365,44 @@ def load_emulator(path: str, verbose: bool = False) -> dict:
         for k, v in specsimile.jxrun.load_emulator(path).items():
             bundle[f'{prefix}_{k}'] = v
 
+    Parameters
+    ----------
+    path : str
+        Path to the PyTorch .pt checkpoint file.
+    verbose : bool, optional
+        If True, print diagnostic information. Default is False.
+
     Returns
     -------
-    dict with keys: W0, b0, …, n_layers, norm_x_mean, norm_x_std, …
+    dict
+        Flat parameter bundle with keys: W0, b0, …, n_layers,
+        norm_x_mean, norm_x_std, … (no prefix).
     """
     return load_decoder_bundle(path, prefix='', verbose=verbose)
 
-def _jax_apply_activation(h, acti_name: str):
+def _jax_apply_activation(h: jnp.ndarray, acti_name: str) -> jnp.ndarray:
+    """
+    Apply a named activation function to an array.
+
+    Parameters
+    ----------
+    h : jnp.ndarray
+        Input array of arbitrary shape.
+    acti_name : str
+        Name of the activation function. Supported values are:
+        'LeakyReLU', 'ReLU', 'Tanh', 'Softplus', 'GELU', 'SELU',
+        'LeakySoftplus'.
+
+    Returns
+    -------
+    jnp.ndarray
+        Activated array of the same shape as *h*.
+
+    Raises
+    ------
+    ValueError
+        If *acti_name* is not one of the supported activation names.
+    """
     if acti_name == 'LeakyReLU':
         return jax.nn.leaky_relu(h, negative_slope=0.01)
     elif acti_name == 'ReLU':
@@ -287,15 +446,19 @@ def load_decoder_bundle(path: str, prefix: str = '', verbose: bool = False) -> d
     ----------
     path : str
         Path to the PyTorch .pt checkpoint.
-    prefix : str
+    prefix : str, optional
         Key prefix added to every entry.  Use e.g. ``'hot'`` so that the
         resulting keys are ``hot_W0``, ``hot_b0``, … matching the convention
-        in *difflike.py*.
-    verbose : bool
+        in *difflike.py*. Default is ''.
+    verbose : bool, optional
+        If True, print diagnostic information about layers and normalisation.
+        Default is False.
 
     Returns
     -------
-    dict  (all values are JAX arrays or plain Python scalars/booleans)
+    dict
+        Flat parameter bundle where all values are JAX arrays or plain Python
+        scalars/booleans.
     """
     p = f'{prefix}_' if prefix else ''
     emu_weights = extract_pytorch_emulator_weights(path, verbose=verbose)
@@ -472,9 +635,21 @@ def load_decoder_bundle(path: str, prefix: str = '', verbose: bool = False) -> d
 
 
 
-def get_bundle_paramnames(bundle: dict, prefix: str) -> list:
+def get_bundle_paramnames(bundle: dict, prefix: str) -> List[str]:
     """
     Return the input parameter names for the emulator stored under *prefix*.
+
+    Parameters
+    ----------
+    bundle : dict
+        Parameter bundle as returned by :func:`load_decoder_bundle`.
+    prefix : str
+        Key prefix under which the emulator was stored, e.g. ``'hot'``.
+
+    Returns
+    -------
+    list of str
+        Ordered list of input parameter names as stored in the checkpoint.
 
     Raises
     ------
@@ -487,9 +662,21 @@ def get_bundle_paramnames(bundle: dict, prefix: str) -> list:
     return list(bundle[key])
 
 
-def get_bundle_ynames(bundle: dict, prefix: str) -> list:
+def get_bundle_ynames(bundle: dict, prefix: str) -> List[str]:
     """
     Return the output (y) column names for the emulator stored under *prefix*.
+
+    Parameters
+    ----------
+    bundle : dict
+        Parameter bundle as returned by :func:`load_decoder_bundle`.
+    prefix : str
+        Key prefix under which the emulator was stored, e.g. ``'hot'``.
+
+    Returns
+    -------
+    list of str
+        Ordered list of output column names as stored in the checkpoint.
 
     Raises
     ------
@@ -508,8 +695,8 @@ def get_bundle_ynames(bundle: dict, prefix: str) -> list:
 def jax_encoder_forward_kw(
     bundle: dict,
     prefix: str,
-    kwargs,
-) -> "jnp.ndarray | dict":
+    kwargs: Dict[str, jnp.ndarray],
+) -> jnp.ndarray:
     """
     Keyword-argument wrapper around :func:`jax_encoder_forward`.
 
@@ -522,31 +709,30 @@ def jax_encoder_forward_kw(
     ----------
     bundle : dict
         Parameter bundle as returned by :func:`load_decoder_bundle` or
-        :func:`load_emulator`.  Must contain ``{prefix}_paramnames`` and,
-        when *return_dict* is True, ``{prefix}_ynames``.
+        :func:`load_emulator`.  Must contain ``{prefix}_paramnames``.
     prefix : str
         Key prefix under which the emulator was stored, e.g. ``'hot'``.
-    kwargs : jnp.ndarray, shape (N,) each
-        One keyword argument per input feature, named exactly as stored in
-        ``paramnames``.  All arrays must have the same leading dimension N.
+    kwargs : dict of str to jnp.ndarray
+        One entry per input feature, named exactly as stored in
+        ``paramnames``.  Each array must have shape (N,) and all must share
+        the same leading dimension N.
 
     Returns
     -------
-    jnp.ndarray, shape (N, n_outputs)
-        Raw encoder output, denormalised but before any decoder transform.
+    jnp.ndarray
+        Raw encoder output of shape (N, n_outputs), denormalised but before
+        any decoder transform.
 
     Raises
     ------
     KeyError
         If a required input feature is missing from *kwargs*, or if the
-        bundle does not contain paramnames / ynames.
+        bundle does not contain paramnames.
 
     Examples
     --------
     >>> out = jax_encoder_forward_kw(bundle, 'L',
-    ...     M_BH=log10_M_BH, log_mdot=log_mdot, cos_inc=cos_inc, ...)
-    >>> logLUV = out['LUV']          # (N,)
-    >>> logL2keV = out['L2keV']      # (N,)
+    ...     {'M_BH': log10_M_BH, 'log_mdot': log_mdot, 'cos_inc': cos_inc})
     """
     paramnames = get_bundle_paramnames(bundle, prefix)
 
@@ -562,10 +748,11 @@ def jax_encoder_forward_kw(
 def jax_encoder_forward_kw_dict(
     bundle: dict,
     prefix: str,
-    kwargs,
-) -> "jnp.ndarray | dict":
+    kwargs: Dict[str, jnp.ndarray],
+) -> Dict[str, jnp.ndarray]:
     """
-    Keyword-argument wrapper around :func:`jax_encoder_forward`.
+    Keyword-argument wrapper around :func:`jax_encoder_forward` returning a
+    dict keyed by output name.
 
     Instead of passing a pre-stacked ``(N, n_params)`` array you pass each
     input feature by name.  The function looks up the stored ``paramnames``
@@ -576,18 +763,19 @@ def jax_encoder_forward_kw_dict(
     ----------
     bundle : dict
         Parameter bundle as returned by :func:`load_decoder_bundle` or
-        :func:`load_emulator`.  Must contain ``{prefix}_paramnames`` and,
-        when *return_dict* is True, ``{prefix}_ynames``.
+        :func:`load_emulator`.  Must contain ``{prefix}_paramnames`` and
+        ``{prefix}_ynames``.
     prefix : str
         Key prefix under which the emulator was stored, e.g. ``'hot'``.
-    **kwargs : jnp.ndarray, shape (N,) each
-        One keyword argument per input feature, named exactly as stored in
-        ``paramnames``.  All arrays must have the same leading dimension N.
+    kwargs : dict of str to jnp.ndarray
+        One entry per input feature, named exactly as stored in
+        ``paramnames``.  Each array must have shape (N,) and all must share
+        the same leading dimension N.
 
     Returns
     -------
-    dict[str, jnp.ndarray]
-        Keys are the ynames of the emulator; values are ``(N,)`` arrays.
+    dict of str to jnp.ndarray
+        Keys are the ynames of the emulator; values are arrays of shape (N,).
 
     Raises
     ------
@@ -597,10 +785,10 @@ def jax_encoder_forward_kw_dict(
 
     Examples
     --------
-    >>> out = jax_encoder_forward_kw(bundle, 'L',
-    ...     M_BH=log10_M_BH, log_mdot=log_mdot, cos_inc=cos_inc, ...)
-    >>> logLUV = out['LUV']          # (N,)
-    >>> logL2keV = out['L2keV']      # (N,)
+    >>> out = jax_encoder_forward_kw_dict(bundle, 'L',
+    ...     {'M_BH': log10_M_BH, 'log_mdot': log_mdot, 'cos_inc': cos_inc})
+    >>> logLUV = out['LUV']      # (N,)
+    >>> logL2keV = out['L2keV']  # (N,)
     """
     h = jax_encoder_forward_kw(bundle, prefix, kwargs)
 

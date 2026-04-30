@@ -2,9 +2,36 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib as mpl
+from matplotlib.figure import Figure
+from matplotlib.axes import Axes
+from typing import Optional
 
 
-def plot_error_hist(eval_out, bins=50, logx=True):
+def plot_error_hist(
+    eval_out: dict,
+    bins: int = 50,
+    logx: bool = True,
+) -> tuple[Figure, Axes]:
+    """
+    Plot a histogram of RMS errors from emulator evaluation output.
+
+    Parameters
+    ----------
+    eval_out : dict
+        Output dictionary from Emulator.evaluate(), must contain key ``"err"``
+        with an array of per-sample RMS errors.
+    bins : int, optional
+        Number of histogram bins. Default is 50.
+    logx : bool, optional
+        If True, use a log scale on the x-axis. Default is True.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+        The matplotlib Figure object.
+    ax : matplotlib.axes.Axes
+        The matplotlib Axes object.
+    """
     err = np.asarray(eval_out["err"], float)
     fig, ax = plt.subplots(figsize=(5.5, 3.5))
     e = err[np.isfinite(err)]
@@ -25,15 +52,46 @@ def plot_error_hist(eval_out, bins=50, logx=True):
     return fig, ax
 
 
-def plot_fit_examples(eval_out, n_first=12, n_worst=12, yscale="log", legend=False):
+def plot_fit_examples(
+    eval_out: dict,
+    n_first: int = 12,
+    n_worst: int = 12,
+    yscale: str = "log",
+    legend: bool = False,
+) -> tuple[Figure, np.ndarray]:
+    """
+    Plot example spectral fits for the first and worst-error samples.
+
+    Parameters
+    ----------
+    eval_out : dict
+        Output dictionary from Emulator.evaluate(), must contain keys
+        ``"x"``, ``"y_true"``, ``"yhat"``, ``"err"``, and optionally
+        ``"xnames"``, ``"z_norm"``, ``"z_phys"``, ``"dec_params"``.
+    n_first : int, optional
+        Number of first (by index) samples to plot. Default is 12.
+    n_worst : int, optional
+        Number of worst-error samples to plot. Default is 12.
+    yscale : str, optional
+        Scale for the y-axis; ``"log"`` for logarithmic, ``"linear"`` for
+        linear. Default is ``"log"``.
+    legend : bool, optional
+        If True, display a legend with latent and physical parameter values
+        on each panel. Default is False.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+        The matplotlib Figure object.
+    axes : numpy.ndarray of matplotlib.axes.Axes
+        2-D array of Axes objects with shape ``(4, ncol2)``.
+    """
     x = eval_out["x"]
     y = eval_out["y_true"]
     yhat = eval_out["yhat"]
     err = eval_out["err"]
     xnames = eval_out.get("xnames", None)
 
-    # If xnames are available the x-axis is a band index and we switch to
-    # a linear scale with labelled ticks instead of a log frequency axis.
     use_xnames = xnames is not None and len(xnames) == len(x)
 
     n = len(err)
@@ -52,16 +110,14 @@ def plot_fit_examples(eval_out, n_first=12, n_worst=12, yscale="log", legend=Fal
         squeeze=False, sharex=True,
     )
 
-    def _plot(ax, i):
+    def _plot(ax: Axes, i: int) -> None:
         yt = np.asarray(y[i], float)
         yp = np.asarray(yhat[i], float)
         if use_xnames:
-            # Linear x-scale; x is just integer band indices
             ax.plot(x, np.clip(yt, 1e-300, None), "k-", lw=1.5, label="true")
             ax.plot(x, np.clip(yp, 1e-300, None), "r--", lw=1.2, label="pred")
             if yscale == "log":
                 ax.set_yscale("log")
-            # Tick every band, rotated for readability
             ax.set_xticks(x)
             ax.set_xticklabels(xnames, rotation=90, fontsize=6)
         else:
@@ -93,32 +149,37 @@ params={" ".join(['%.2f' % v for v in eval_out["dec_params"][i]]) if eval_out.ge
     fig.tight_layout()
     return fig, axes
 
-def plot_residual_hist(eval_out, bins=50, yscale="log"):
+
+def plot_residual_hist(
+    eval_out: dict,
+    bins: int = 50,
+    yscale: str = "log",
+) -> tuple[Figure, Axes]:
     """
     One panel with one histogram per x-grid point showing (pred - true).
 
     Parameters
     ----------
     eval_out : dict
-        Output of Emulator.evaluate().
-    bins : int
-        Number of histogram bins.
-    yscale : 'linear' or 'log'
-        If True, use  log10(yhat / y_true) (log10 space residuals).
-        If False, use yhat - y_true (linear residuals).
+        Output of Emulator.evaluate(), must contain keys ``"x"``,
+        ``"yhat"``, ``"y_true"``, and optionally ``"xnames"``,
+        ``"xlabel"``, ``"ylabel"``, ``"yunit"``.
+    bins : int, optional
+        Number of histogram bins. Default is 50.
+    yscale : str, optional
+        If ``"log"``, use log10(yhat / y_true) (log10-space residuals).
+        Otherwise, use yhat - y_true (linear residuals). Default is ``"log"``.
 
     Returns
     -------
-    fig: object
-        matplotlib figure
-    ax: object
-        matplotlib axis.
+    fig : matplotlib.figure.Figure
+        The matplotlib Figure object.
+    ax : matplotlib.axes.Axes
+        The matplotlib Axes object.
     """
-    # spectral grid 
     x = np.asarray(eval_out["x"], float)
     ncol = len(x)
 
-    # name of the flux axis, and units
     ylabel  = eval_out.get("ylabel", "")
     yunit   = eval_out.get("yunit", "")
     if eval_out.get('xnames', None) is not None and len(eval_out['xnames']) == ncol:
@@ -128,13 +189,13 @@ def plot_residual_hist(eval_out, bins=50, yscale="log"):
         xnames = [f"{xlabel} {x[i]:.3g}" for i in range(ncol)]
 
     if yscale == 'log':
-        pred = np.asarray(eval_out["yhat"], float)         # (N, n_x), linear space
-        true = np.asarray(eval_out["y_true"], float)       # (N, n_x), linear space
+        pred = np.asarray(eval_out["yhat"], float)
+        true = np.asarray(eval_out["y_true"], float)
         residuals = np.log10((pred + 1e-60) / (true + 1e-50))
         res_label = r"$\log(\hat{y} / y)$" + f' {ylabel} [{yunit}]'
     else:
-        pred = np.asarray(eval_out["yhat"], float)         # (N, n_x), linear space
-        true = np.asarray(eval_out["y_true"], float)       # (N, n_x), linear space
+        pred = np.asarray(eval_out["yhat"], float)
+        true = np.asarray(eval_out["y_true"], float)
         residuals = pred - true
         res_label = r"$\hat{y} - y$" + f' {ylabel} [{yunit}]'
 
@@ -153,14 +214,48 @@ def plot_residual_hist(eval_out, bins=50, yscale="log"):
     fig.tight_layout()
     return fig, ax
 
-def plot_fit_diff(eval_out, yscale="log", min_ratio=1.0, min_diff=0.0):
+
+def plot_fit_diff(
+    eval_out: dict,
+    yscale: str = "log",
+    min_ratio: float = 1.0,
+    min_diff: float = 0.0,
+) -> tuple[Figure, np.ndarray]:
+    """
+    Scatter plots of predicted vs. true values and their residuals per output
+    dimension.
+
+    Parameters
+    ----------
+    eval_out : dict
+        Output dictionary from Emulator.evaluate(), must contain keys
+        ``"x"``, ``"y_true"``, ``"yhat"``, ``"err"``, and optionally
+        ``"xnames"``, ``"labels"``, ``"ylabel"``, ``"yunit"``.
+    yscale : str, optional
+        Scale for axes; ``"log"`` for log-log scatter and ratio residuals,
+        anything else for linear scatter and difference residuals.
+        Default is ``"log"``.
+    min_ratio : float, optional
+        Minimum symmetric y-axis range for ratio (pred/true) panels when
+        ``yscale="log"``. Default is 1.0.
+    min_diff : float, optional
+        Minimum symmetric y-axis range for difference (pred-true) panels
+        when ``yscale`` is not ``"log"``. Default is 0.0.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+        The matplotlib Figure object.
+    axes : numpy.ndarray of matplotlib.axes.Axes
+        2-D array of Axes objects with shape ``(2, ncol)`` where ``ncol``
+        equals the number of output dimensions.
+    """
     x = eval_out["x"]
     y = eval_out["y_true"]
     yhat = eval_out["yhat"]
     err = eval_out['err']
     xnames = eval_out.get("xnames", None)
 
-    # Use xnames as labels when available (DenseDecoder case)
     use_xnames = xnames is not None and len(xnames) == len(x)
 
     ncol = len(x)
@@ -214,13 +309,38 @@ def plot_fit_diff(eval_out, yscale="log", min_ratio=1.0, min_diff=0.0):
             ydiffhi = max(abs(ydifflo), ydiffhi, min_diff)
             axdiff.set_ylim(-ydiffhi, ydiffhi)
             axdiff.plot([ylo, yhi], [0, 0], '--', color='k')
-        #axdiff.grid(True, which="both", alpha=0.2)
 
     fig.tight_layout()
     return fig, axes
 
 
-def plot_param_corner_scatter(eval_out, param_names=None, max_points=5000):
+def plot_param_corner_scatter(
+    eval_out: dict,
+    param_names: Optional[list[str]] = None,
+    max_points: int = 5000,
+) -> tuple[Figure, np.ndarray]:
+    """
+    Corner scatter plot of input parameters coloured by log10 RMS error.
+
+    Parameters
+    ----------
+    eval_out : dict
+        Output dictionary from Emulator.evaluate(), must contain keys
+        ``"params"`` with shape ``(N, D)`` and ``"err"`` with shape ``(N,)``.
+    param_names : list of str, optional
+        Names for each of the D parameter dimensions. If None or of wrong
+        length, defaults to ``["p0", "p1", ...]``. Default is None.
+    max_points : int, optional
+        Maximum number of points to plot; a random subset is drawn when the
+        dataset is larger. Default is 5000.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+        The matplotlib Figure object.
+    axes : numpy.ndarray of matplotlib.axes.Axes
+        2-D array of Axes objects with shape ``(D, D)``.
+    """
     P = np.asarray(eval_out["params"], float)
     err = np.asarray(eval_out["err"], float)
     N, D = P.shape
@@ -273,7 +393,35 @@ def plot_param_corner_scatter(eval_out, param_names=None, max_points=5000):
     return fig, axes
 
 
-def plot_decoder_param_corner_scatter(eval_out, param_names=None, max_points=5000):
+def plot_decoder_param_corner_scatter(
+    eval_out: dict,
+    param_names: Optional[list[str]] = None,
+    max_points: int = 5000,
+) -> tuple[Figure, np.ndarray]:
+    """
+    Corner scatter plot of decoder (latent-to-params) parameters coloured by
+    log10 RMS error.
+
+    Parameters
+    ----------
+    eval_out : dict
+        Output dictionary from Emulator.evaluate(), must contain key
+        ``"dec_params"`` with shape ``(N, D)`` and ``"err"`` with shape
+        ``(N,)``. Raises ``RuntimeError`` if ``"dec_params"`` is absent.
+    param_names : list of str, optional
+        Names for each of the D decoder-parameter dimensions. If None or of
+        wrong length, defaults to ``["q0", "q1", ...]``. Default is None.
+    max_points : int, optional
+        Maximum number of points to plot; a random subset is drawn when the
+        dataset is larger. Default is 5000.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+        The matplotlib Figure object.
+    axes : numpy.ndarray of matplotlib.axes.Axes
+        2-D array of Axes objects with shape ``(D, D)``.
+    """
     Q = eval_out.get("dec_params", None)
     if Q is None:
         raise RuntimeError("dec_params not available (decoder may not implement latent_to_params)")

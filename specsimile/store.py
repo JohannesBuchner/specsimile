@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import h5py
 import numpy as np
+from typing import Optional, Union, List
 
 try:
     import astropy.units as u
@@ -11,8 +12,20 @@ except Exception:  # astropy optional
     u = None
 
 
-def _unit_to_string(unit):
-    """Accept astropy Unit, Quantity, str, or None; return str or ''."""
+def _unit_to_string(unit: Optional[Union[str, "u.UnitBase", "u.Quantity"]]) -> str:
+    """
+    Accept astropy Unit, Quantity, str, or None; return str or ''.
+
+    Parameters
+    ----------
+    unit : str, astropy.units.UnitBase, astropy.units.Quantity, or None
+        The unit to convert to a string representation.
+
+    Returns
+    -------
+    str
+        String representation of the unit, or empty string if None.
+    """
     if unit is None:
         return ""
     if isinstance(unit, str):
@@ -26,13 +39,39 @@ def _unit_to_string(unit):
     return str(unit)
 
 
-def _as_bytes_array(strings):
+def _as_bytes_array(strings: Optional[List[Union[str, bytes]]]) -> Optional[np.ndarray]:
+    """
+    Convert a list of strings or bytes to a numpy array of bytes.
+
+    Parameters
+    ----------
+    strings : list of str or bytes, or None
+        The strings to convert.
+
+    Returns
+    -------
+    numpy.ndarray or None
+        Array of utf-8 encoded bytes, or None if input is None.
+    """
     if strings is None:
         return None
     return np.asarray([s.encode("utf-8") if isinstance(s, str) else s for s in strings])
 
 
-def _as_str_list(arr):
+def _as_str_list(arr: Optional[Union[np.ndarray, List]]) -> Optional[List[str]]:
+    """
+    Convert a numpy array or list of bytes/strings to a list of str.
+
+    Parameters
+    ----------
+    arr : numpy.ndarray, list, or None
+        Array of bytes or strings to convert.
+
+    Returns
+    -------
+    list of str or None
+        List of decoded strings, or None if input is None.
+    """
     if arr is None:
         return None
     out = []
@@ -62,16 +101,41 @@ class DatasetWriter:
         self,
         filename: str,
         N: int,
-        x,
-        paramnames,
+        x: Union[np.ndarray, List[float]],
+        paramnames: List[str],
         *,
-        xnames=None,
+        xnames: Optional[List[str]] = None,
         xlabel: str = "",
         ylabel: str = "",
-        xunit=None,
-        yunit=None,
+        xunit: Optional[Union[str, "u.UnitBase", "u.Quantity"]] = None,
+        yunit: Optional[Union[str, "u.UnitBase", "u.Quantity"]] = None,
         mode: str = "w",
     ):
+        """
+        Parameters
+        ----------
+        filename : str
+            Path to the HDF5 file to create (a '.tmp' suffix is used during writing).
+        N : int
+            Total number of training rows to allocate.
+        x : array_like of shape (X,)
+            The x-axis grid, must be 1D.
+        paramnames : list of str
+            Names of the parameters, length P.
+        xnames : list of str, optional
+            Names for each x-axis point, length must match x. If provided,
+            stored as a 'xnames' dataset.
+        xlabel : str, optional
+            Label for the x-axis. Default is ''.
+        ylabel : str, optional
+            Label for the y-axis. Default is ''.
+        xunit : str, astropy.units.UnitBase, astropy.units.Quantity, or None, optional
+            Unit for the x-axis.
+        yunit : str, astropy.units.UnitBase, astropy.units.Quantity, or None, optional
+            Unit for the y-axis.
+        mode : str, optional
+            HDF5 file open mode. Default is 'w'.
+        """
         self.filename = str(filename)
         self._f = h5py.File(self.filename + ".tmp", mode=mode)
 
@@ -113,17 +177,38 @@ class DatasetWriter:
 
         self._f.flush()
 
-    def _check_open(self):
+    def _check_open(self) -> None:
         if self._f is None:
             raise RuntimeError("Writer is closed")
 
-    def _check_x(self, x: np.ndarray):
+    def _check_x(self, x: np.ndarray) -> None:
         x0 = self._f["x"][()]
         if x.shape != x0.shape or not np.allclose(x, x0, rtol=0, atol=0):
             raise ValueError("x does not match stored x grid")
 
-    def append(self, x, y, params) -> int:
-        """Write a single row.  Returns the row index written."""
+    def append(
+        self,
+        x: Union[np.ndarray, List[float]],
+        y: Union[np.ndarray, List[float]],
+        params: Union[np.ndarray, List[float]],
+    ) -> int:
+        """
+        Write a single row.
+
+        Parameters
+        ----------
+        x : array_like of shape (X,)
+            The x-axis grid; must match the stored x grid exactly.
+        y : array_like of shape (Y,)
+            The y values for this row.
+        params : array_like of shape (P,)
+            The parameter values for this row.
+
+        Returns
+        -------
+        int
+            The row index that was written.
+        """
         self._check_open()
 
         x = np.asarray(x, dtype=np.float64)
@@ -163,24 +248,35 @@ class DatasetWriter:
 
         return i
 
-    def set(self, x, y, params) -> slice:
+    def set(
+        self,
+        x: Union[np.ndarray, List[float]],
+        y: Union[np.ndarray, List[List[float]]],
+        params: Union[np.ndarray, List[List[float]]],
+    ) -> slice:
         """
         Write all rows at once.
 
         Parameters
         ----------
-        x      : (X,) array  — must match the stored x grid exactly.
-        y      : (N, Y) array
-        params : (N, P) array
+        x : array_like of shape (X,)
+            The x-axis grid; must match the stored x grid exactly.
+        y : array_like of shape (N, Y)
+            All y values to write.
+        params : array_like of shape (N, P)
+            All parameter values to write.
 
         Returns
         -------
-        The slice written, i.e. slice(i0, i0 + n_rows).
+        slice
+            The slice written, i.e. ``slice(i0, i0 + n_rows)``.
 
         Raises
         ------
-        RuntimeError  if the writer is closed or there is insufficient space.
-        ValueError    if shapes are inconsistent.
+        RuntimeError
+            If the writer is closed or there is insufficient space.
+        ValueError
+            If shapes are inconsistent.
         """
         self._check_open()
 
@@ -235,7 +331,12 @@ class DatasetWriter:
 
         return slice(i0, i1)
 
-    def close(self):
+    def close(self) -> None:
+        """
+        Close the writer and atomically rename the temporary file to the final filename.
+
+        If the final file already exists, it is removed before renaming.
+        """
         if self._f is not None:
             try:
                 # remove any previous file if it exists, to not leave broken files
@@ -249,10 +350,10 @@ class DatasetWriter:
             finally:
                 self._f = None
 
-    def __enter__(self):
+    def __enter__(self) -> "DatasetWriter":
         return self
 
-    def __exit__(self, exc_type, exc, tb):
+    def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
 
 
@@ -261,21 +362,48 @@ class DatasetReader:
     Read emulator training dataset from HDF5.
     """
 
-    def __init__(self, filename: str, mode: str = "r",
-                 xlabel=None, ylabel=None, xunit=None, yunit=None):
+    def __init__(
+        self,
+        filename: str,
+        mode: str = "r",
+        xlabel: Optional[str] = None,
+        ylabel: Optional[str] = None,
+        xunit: Optional[str] = None,
+        yunit: Optional[str] = None,
+    ):
+        """
+        Parameters
+        ----------
+        filename : str
+            Path to the HDF5 file to read.
+        mode : str, optional
+            HDF5 file open mode. Default is 'r'.
+        xlabel : str, optional
+            Override for the x-axis label stored in the file. If None, reads
+            from file attributes.
+        ylabel : str, optional
+            Override for the y-axis label stored in the file. If None, reads
+            from file attributes.
+        xunit : str, optional
+            Override for the x-axis unit stored in the file. If None, reads
+            from file attributes.
+        yunit : str, optional
+            Override for the y-axis unit stored in the file. If None, reads
+            from file attributes.
+        """
         if not os.path.exists(filename):
             raise FileNotFoundError(filename)
         self.filename = filename
         self._f = h5py.File(self.filename, mode=mode)
-        self.xlabel = xlabel or str(self._f.attrs.get("xlabel", ""))
-        self.ylabel = ylabel or str(self._f.attrs.get("ylabel", ""))
-        self.xunit = xunit or str(self._f.attrs.get("xunit", ""))
-        self.yunit = yunit or str(self._f.attrs.get("yunit", ""))
-        self.params = self._f["params"][()].astype(np.float64)
-        self.paramnames = _as_str_list(self._f["paramnames"][()])
-        self.x = self._f["x"][()].astype(np.float64)
-        self.y = self._f["y"][()].astype(np.float64)
-        self.xnames = (
+        self.xlabel: str = xlabel or str(self._f.attrs.get("xlabel", ""))
+        self.ylabel: str = ylabel or str(self._f.attrs.get("ylabel", ""))
+        self.xunit: str = xunit or str(self._f.attrs.get("xunit", ""))
+        self.yunit: str = yunit or str(self._f.attrs.get("yunit", ""))
+        self.params: np.ndarray = self._f["params"][()].astype(np.float64)
+        self.paramnames: List[str] = _as_str_list(self._f["paramnames"][()])
+        self.x: np.ndarray = self._f["x"][()].astype(np.float64)
+        self.y: np.ndarray = self._f["y"][()].astype(np.float64)
+        self.xnames: Optional[List[str]] = (
             _as_str_list(self._f["xnames"][()])
             if "xnames" in self._f else None
         )
@@ -292,15 +420,18 @@ class DatasetReader:
     def __len__(self) -> int:
         return int(self.y.shape[0])
 
-    def close(self):
+    def close(self) -> None:
+        """
+        Close the underlying HDF5 file.
+        """
         if self._f is not None:
             try:
                 self._f.close()
             finally:
                 self._f = None
 
-    def __enter__(self):
+    def __enter__(self) -> "DatasetReader":
         return self
 
-    def __exit__(self, exc_type, exc, tb):
+    def __exit__(self, exc_type, exc, tb) -> None:
         self.close()

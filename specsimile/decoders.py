@@ -5,12 +5,28 @@ import hashlib
 import numpy as np
 import torch
 import torch.nn as nn
+from typing import Optional, List, Tuple, Union
 
 ln10 = np.log(10.0)
 
 
-def sigmoid_asinh(x, lo, hi):
-    """Smooth squashing R -> (lo, hi) using asinh."""
+def sigmoid_asinh(x: torch.Tensor, lo: float, hi: float) -> torch.Tensor:
+    """Smooth squashing R -> (lo, hi) using asinh.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        Input tensor of arbitrary shape.
+    lo : float
+        Lower bound of the output range.
+    hi : float
+        Upper bound of the output range.
+
+    Returns
+    -------
+    torch.Tensor
+        Squashed tensor with values in (lo, hi), same shape as ``x``.
+    """
     spread = hi - lo
     mid = (lo + hi) / 2.0
     return mid + (spread / 4.0) * torch.asinh(x)
@@ -21,23 +37,35 @@ class _XSetterMixin:
     Allow setting decoder.x later via: decoder.x = new_grid
     Stores a float64 torch buffer called _x.
     """
-    def _set_x(self, x):
+    def _set_x(self, x: Union[np.ndarray, list]) -> None:
+        """Register or overwrite the x-grid buffer.
+
+        Parameters
+        ----------
+        x : array-like
+            1-D array of x-grid values. Will be cast to float64.
+
+        Raises
+        ------
+        ValueError
+            If ``x`` is not 1-D.
+        """
         x = np.asarray(x, float)
         if x.ndim != 1:
             raise ValueError(f"x must be 1D, got {x.shape}")
         t = torch.tensor(x, dtype=torch.float64)
         if hasattr(self, "_x"):
-            # overwrite buffer
             self._buffers["_x"] = t
         else:
             self.register_buffer("_x", t)
 
     @property
-    def x(self):
+    def x(self) -> torch.Tensor:
+        """torch.Tensor: The registered x-grid buffer (float64, 1-D)."""
         return self._x
 
     @x.setter
-    def x(self, value):
+    def x(self, value: Union[np.ndarray, list]) -> None:
         self._set_x(value)
 
 
@@ -48,9 +76,24 @@ class DecoderConfigMixin:
     Do NOT include x (grid) because x is dataset/user provided at inference.
     """
     def get_config(self) -> dict:
+        """Return a JSON-serializable configuration dictionary.
+
+        Returns
+        -------
+        dict
+            Dictionary of constructor arguments that affect
+            ``normalize()`` or ``latent_to_params()``.
+        """
         return {}
 
     def config_hash(self) -> str:
+        """Return a SHA-256 hex digest of the serialized configuration.
+
+        Returns
+        -------
+        str
+            64-character hexadecimal string uniquely identifying the config.
+        """
         s = json.dumps(self.get_config(), sort_keys=True)
         return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
@@ -58,7 +101,23 @@ class DecoderConfigMixin:
 class DenseDecoder(nn.Module, DecoderConfigMixin):
     """latent_dim = y_dim ; forward(z)=z."""
 
-    def __init__(self, y_dim: int, paramnames = None):
+    def __init__(self, y_dim: int, paramnames: Optional[List[str]] = None) -> None:
+        """Initialise a pass-through dense decoder.
+
+        Parameters
+        ----------
+        y_dim : int
+            Dimensionality of the output (and latent) space.
+        paramnames : list of str, optional
+            Names for each output parameter. Defaults to
+            ``["y0", "y1", ...]`` when not provided.
+
+        Raises
+        ------
+        ValueError
+            If ``paramnames`` is provided but its length differs from
+            ``y_dim``.
+        """
         super().__init__()
         self.y_dim = int(y_dim)
         self.latent_dim = self.y_dim
@@ -70,6 +129,28 @@ class DenseDecoder(nn.Module, DecoderConfigMixin):
             raise ValueError(f"paramnames={paramnames} must be same length as y_dim={y_dim}")
 
     def normalize(self, y: np.ndarray, params: np.ndarray) -> dict:
+        """Compute normalisation statistics from training data.
+
+        Parameters
+        ----------
+        y : np.ndarray
+            Observed spectra / outputs, shape ``(N, Y)``.
+        params : np.ndarray
+            Physical input parameters, shape ``(N, P)``.
+
+        Returns
+        -------
+        dict
+            Nested dictionary with keys ``"params"``, ``"latent"``, and
+            ``"y"``, each containing the statistics required to standardise
+            that quantity at training and inference time.
+
+        Raises
+        ------
+        ValueError
+            If ``y`` or ``params`` are not 2-D, or their leading dimensions
+            differ.
+        """
         y = np.asarray(y, dtype=np.float64)
         params = np.asarray(params, dtype=np.float64)
         if y.ndim != 2 or params.ndim != 2 or y.shape[0] != params.shape[0]:
@@ -82,12 +163,43 @@ class DenseDecoder(nn.Module, DecoderConfigMixin):
         }
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """Pass latent vector through unchanged.
+
+        Parameters
+        ----------
+        z : torch.Tensor
+            Latent tensor of shape ``(N, latent_dim)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Same tensor ``z``, shape ``(N, latent_dim)``.
+        """
         return z
 
     def latent_to_params(self, z: torch.Tensor) -> torch.Tensor:
+        """Map latent codes to physical parameters (identity here).
+
+        Parameters
+        ----------
+        z : torch.Tensor
+            Latent tensor of shape ``(N, latent_dim)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Physical parameter tensor, shape ``(N, latent_dim)``.
+        """
         return z
 
     def get_config(self) -> dict:
+        """Return serialisable constructor arguments.
+
+        Returns
+        -------
+        dict
+            Dictionary with keys ``"y_dim"`` and ``"paramnames"``.
+        """
         return dict(
             y_dim=int(self.y_dim),
             paramnames=list(self.paramnames),
@@ -96,13 +208,47 @@ class DenseDecoder(nn.Module, DecoderConfigMixin):
 class LogDenseDecoder(DenseDecoder):
     """latent_dim=y_dim ; forward(z)=z interpreted as log10(y)."""
 
-    def __init__(self, y_dim: int, eps: float = 1e-30, paramnames=None):
+    def __init__(self, y_dim: int, eps: float = 1e-30, paramnames: Optional[List[str]] = None) -> None:
+        """Initialise a log-space dense decoder.
+
+        Parameters
+        ----------
+        y_dim : int
+            Dimensionality of the output (and latent) space.
+        eps : float, optional
+            Small floor applied before taking ``log10`` to avoid
+            ``log(0)``. Default is ``1e-30``.
+        paramnames : list of str, optional
+            Names for each output parameter. Defaults to
+            ``["logy0", "logy1", ...]`` when not provided.
+        """
         super().__init__(
             y_dim=y_dim,
             paramnames=paramnames or [f"logy{i}" for i in range(y_dim)])
         self.eps = float(eps)
 
     def normalize(self, y: np.ndarray, params: np.ndarray) -> dict:
+        """Compute normalisation statistics in log10 space.
+
+        Parameters
+        ----------
+        y : np.ndarray
+            Observed spectra / outputs (linear scale), shape ``(N, Y)``.
+        params : np.ndarray
+            Physical input parameters, shape ``(N, P)``.
+
+        Returns
+        -------
+        dict
+            Nested dictionary with keys ``"params"``, ``"latent"``, and
+            ``"y"``, where ``"y"["log"]`` is ``True``.
+
+        Raises
+        ------
+        ValueError
+            If ``y`` or ``params`` are not 2-D, or their leading dimensions
+            differ.
+        """
         y = np.asarray(y, dtype=np.float64)
         params = np.asarray(params, dtype=np.float64)
         if y.ndim != 2 or params.ndim != 2 or y.shape[0] != params.shape[0]:
@@ -116,9 +262,29 @@ class LogDenseDecoder(DenseDecoder):
         }
 
     def evaluate(self, z: torch.Tensor) -> torch.Tensor:
+        """Convert log10-space latent codes to linear-scale outputs.
+
+        Parameters
+        ----------
+        z : torch.Tensor
+            Latent tensor interpreted as ``log10(y)``, shape
+            ``(N, latent_dim)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Linear-scale output tensor, shape ``(N, latent_dim)``.
+        """
         return torch.pow(10.0, z)
 
     def get_config(self) -> dict:
+        """Return serialisable constructor arguments.
+
+        Returns
+        -------
+        dict
+            Dictionary extending the parent config with key ``"eps"``.
+        """
         cfg = super().get_config()
         cfg.update(dict(eps=float(self.eps)))
         return cfg
@@ -139,13 +305,36 @@ class CutoffPLDecoder(nn.Module, _XSetterMixin, DecoderConfigMixin):
     def __init__(
         self,
         *,
-        x=None,
-        gamma_lo=0.5,
-        gamma_hi=6.0,
-        xcut_lo=1e-3,
-        xcut_hi=1e6,
-        eps=1e-30,
-    ):
+        x: Optional[np.ndarray] = None,
+        gamma_lo: float = 0.5,
+        gamma_hi: float = 6.0,
+        xcut_lo: float = 1e-3,
+        xcut_hi: float = 1e6,
+        eps: float = 1e-30,
+    ) -> None:
+        """Initialise a cutoff power-law decoder.
+
+        Parameters
+        ----------
+        x : array-like, optional
+            1-D x-grid on which the spectrum is evaluated. Can be set
+            later via ``decoder.x = new_grid``.
+        gamma_lo : float, optional
+            Lower bound for the squashed spectral index ``gamma``.
+            Default is ``0.5``.
+        gamma_hi : float, optional
+            Upper bound for the squashed spectral index ``gamma``.
+            Default is ``6.0``.
+        xcut_lo : float, optional
+            Lower physical bound for the cutoff ``xcut`` (linear scale).
+            Default is ``1e-3``.
+        xcut_hi : float, optional
+            Upper physical bound for the cutoff ``xcut`` (linear scale).
+            Default is ``1e6``.
+        eps : float, optional
+            Floor applied before ``log10`` to avoid ``log(0)``.
+            Default is ``1e-30``.
+        """
         super().__init__()
         if x is not None:
             self._set_x(x)
@@ -158,6 +347,27 @@ class CutoffPLDecoder(nn.Module, _XSetterMixin, DecoderConfigMixin):
         self.logxcut_hi = float(np.log10(xcut_hi))
 
     def normalize(self, y: np.ndarray, params: np.ndarray) -> dict:
+        """Compute normalisation statistics for the cutoff power-law model.
+
+        Parameters
+        ----------
+        y : np.ndarray
+            Observed spectra (linear scale), shape ``(N, D)``.
+        params : np.ndarray
+            Physical input parameters, shape ``(N, P)``.
+
+        Returns
+        -------
+        dict
+            Nested dictionary with keys ``"params"``, ``"latent"``, and
+            ``"y"``.
+
+        Raises
+        ------
+        ValueError
+            If ``y`` or ``params`` are not 2-D, their leading dimensions
+            differ, or all amplitudes are non-finite.
+        """
         y = np.asarray(y, np.float64)
         params = np.asarray(params, np.float64)
         if y.ndim != 2 or params.ndim != 2 or y.shape[0] != params.shape[0]:
@@ -180,7 +390,25 @@ class CutoffPLDecoder(nn.Module, _XSetterMixin, DecoderConfigMixin):
             "y": {"log": True, "eps": self.eps},
         }
 
-    def latent_to_params(self, z_phys: torch.Tensor):
+    def latent_to_params(self, z_phys: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Map raw latent codes to physical parameters.
+
+        Parameters
+        ----------
+        z_phys : torch.Tensor
+            Raw latent tensor of shape ``(N, 3)`` with columns
+            ``[logA, gamma_raw, logxcut_raw]``.
+
+        Returns
+        -------
+        logA : torch.Tensor
+            Log10-amplitude, shape ``(N,)``.
+        gamma : torch.Tensor
+            Squashed spectral index in ``(gamma_lo, gamma_hi)``,
+            shape ``(N,)``.
+        xcut : torch.Tensor
+            Cutoff value in linear scale, shape ``(N,)``.
+        """
         z_phys = z_phys.to(torch.float64)
         logA = z_phys[:, 0]
         gamma = sigmoid_asinh(z_phys[:, 1], self.gamma_lo, self.gamma_hi)
@@ -189,6 +417,18 @@ class CutoffPLDecoder(nn.Module, _XSetterMixin, DecoderConfigMixin):
         return logA, gamma, xcut
 
     def forward(self, z_phys: torch.Tensor) -> torch.Tensor:
+        """Evaluate the cutoff power-law model and return ``log10(y)``.
+
+        Parameters
+        ----------
+        z_phys : torch.Tensor
+            Raw latent tensor of shape ``(N, 3)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Log10-spectrum evaluated on the x-grid, shape ``(N, len(x))``.
+        """
         logA, gamma, xcut = self.latent_to_params(z_phys)
         x = torch.clamp(self.x[None, :], min=1e-300)
         lnA = logA[:, None] * ln10
@@ -197,10 +437,30 @@ class CutoffPLDecoder(nn.Module, _XSetterMixin, DecoderConfigMixin):
         return lny / ln10
 
     def evaluate(self, z_phys: torch.Tensor) -> torch.Tensor:
+        """Evaluate the cutoff power-law model and return linear-scale ``y``.
+
+        Parameters
+        ----------
+        z_phys : torch.Tensor
+            Raw latent tensor of shape ``(N, 3)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Linear-scale spectrum evaluated on the x-grid,
+            shape ``(N, len(x))``.
+        """
         return torch.pow(10.0, self.forward(z_phys))
 
     def get_config(self) -> dict:
-        # store physical bounds (not log-bounds) to avoid ambiguity
+        """Return serialisable constructor arguments.
+
+        Returns
+        -------
+        dict
+            Dictionary with keys ``"gamma_lo"``, ``"gamma_hi"``,
+            ``"xcut_lo"``, ``"xcut_hi"``, and ``"eps"``.
+        """
         return dict(
             gamma_lo=float(self.gamma_lo),
             gamma_hi=float(self.gamma_hi),
@@ -228,16 +488,42 @@ class SBPLDecoder(nn.Module, _XSetterMixin, DecoderConfigMixin):
 
     def __init__(
         self,
-        logx_lo,
-        logx_hi,
+        logx_lo: float,
+        logx_hi: float,
         *,
-        x=None,
-        x0=None,
-        slope_scale=2.5,
-        logwidth_lo=-1.0,
-        logwidth_hi=2.0,
-        eps=1e-30,
-    ):
+        x: Optional[np.ndarray] = None,
+        x0: Optional[float] = None,
+        slope_scale: float = 2.5,
+        logwidth_lo: float = -1.0,
+        logwidth_hi: float = 2.0,
+        eps: float = 1e-30,
+    ) -> None:
+        """Initialise a smooth broken power-law decoder.
+
+        Parameters
+        ----------
+        logx_lo : float
+            Lower bound of the log10-break-position range.
+        logx_hi : float
+            Upper bound of the log10-break-position range.
+        x : array-like, optional
+            1-D x-grid on which the spectrum is evaluated. Can be set
+            later via ``decoder.x = new_grid``.
+        x0 : float, optional
+            Pivot point at which ``y(x0) = 10**lognorm``. Defaults to
+            ``xbrk`` when not provided.
+        slope_scale : float, optional
+            Scaling factor applied to ``asinh`` of the raw slope
+            parameters. Default is ``2.5``.
+        logwidth_lo : float, optional
+            Lower bound for the log10-width of the transition region.
+            Default is ``-1.0``.
+        logwidth_hi : float, optional
+            Upper bound for the log10-width of the transition region.
+            Default is ``2.0``.
+        eps : float, optional
+            Floor applied before ``log10``. Default is ``1e-30``.
+        """
         super().__init__()
         if x is not None:
             self._set_x(x)
@@ -252,10 +538,32 @@ class SBPLDecoder(nn.Module, _XSetterMixin, DecoderConfigMixin):
         self.logx_hi = float(logx_hi)
 
     @property
-    def x0(self):
+    def x0(self) -> Optional[torch.Tensor]:
+        """torch.Tensor or None: Registered pivot point buffer (scalar, float64)."""
         return getattr(self, '_x0', None)
 
     def normalize(self, y: np.ndarray, params: np.ndarray) -> dict:
+        """Compute normalisation statistics for the SBPL model.
+
+        Parameters
+        ----------
+        y : np.ndarray
+            Observed spectra (linear scale), shape ``(N, D)``.
+        params : np.ndarray
+            Physical input parameters, shape ``(N, P)``.
+
+        Returns
+        -------
+        dict
+            Nested dictionary with keys ``"params"``, ``"latent"``, and
+            ``"y"``.
+
+        Raises
+        ------
+        ValueError
+            If ``y`` or ``params`` are not 2-D, their leading dimensions
+            differ, or all amplitudes are non-finite.
+        """
         y = np.asarray(y, np.float64)
         params = np.asarray(params, np.float64)
         if y.ndim != 2 or params.ndim != 2 or y.shape[0] != params.shape[0]:
@@ -278,7 +586,30 @@ class SBPLDecoder(nn.Module, _XSetterMixin, DecoderConfigMixin):
             "y": {"log": True, "eps": self.eps},
         }
 
-    def latent_to_params(self, z_phys: torch.Tensor):
+    def latent_to_params(
+        self, z_phys: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Map raw latent codes to physical SBPL parameters.
+
+        Parameters
+        ----------
+        z_phys : torch.Tensor
+            Raw latent tensor of shape ``(N, 5)`` with columns
+            ``[lognorm, s1_raw, s2_raw, logxbrk_raw, logwidth_raw]``.
+
+        Returns
+        -------
+        lognorm : torch.Tensor
+            Log10-normalisation, shape ``(N,)``.
+        s1 : torch.Tensor
+            Slope below the break, shape ``(N,)``.
+        s2 : torch.Tensor
+            Slope above the break, shape ``(N,)``.
+        xbrk : torch.Tensor
+            Break position in linear scale, shape ``(N,)``.
+        width : torch.Tensor
+            Transition width in linear scale, shape ``(N,)``.
+        """
         z_phys = z_phys.to(torch.float64)
         lognorm = z_phys[:, 0]
         s1 = self.slope_scale * torch.asinh(z_phys[:, 1])
@@ -293,15 +624,25 @@ class SBPLDecoder(nn.Module, _XSetterMixin, DecoderConfigMixin):
         return lognorm, s1, s2, xbrk, width
 
     def forward(self, z_phys: torch.Tensor) -> torch.Tensor:
+        """Evaluate the SBPL model and return ``log10(y)``.
+
+        Parameters
+        ----------
+        z_phys : torch.Tensor
+            Raw latent tensor of shape ``(N, 5)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Log10-spectrum evaluated on the x-grid, shape ``(N, len(x))``.
+        """
         lognorm, s1, s2, xbrk, width = self.latent_to_params(z_phys)
 
         x = torch.clamp(self.x[None, :], min=1e-300)
 
-        # SBPL-like smooth transition in log space
         q = torch.log(x / xbrk[:, None]) / width[:, None]
         q = torch.clamp(q, -50.0, 50.0)
         if self.x0 is not None:
-            # normalised the function with the normalisation at x0
             x0 = torch.clamp(self.x0, min=1e-300)
             qpiv = torch.log(x0 / xbrk) / width
             qpiv = torch.clamp(qpiv, -50.0, 50.0)
@@ -323,9 +664,31 @@ class SBPLDecoder(nn.Module, _XSetterMixin, DecoderConfigMixin):
         return torch.log10(y)
 
     def evaluate(self, z_phys: torch.Tensor) -> torch.Tensor:
+        """Evaluate the SBPL model and return linear-scale ``y``.
+
+        Parameters
+        ----------
+        z_phys : torch.Tensor
+            Raw latent tensor of shape ``(N, 5)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Linear-scale spectrum evaluated on the x-grid,
+            shape ``(N, len(x))``.
+        """
         return torch.pow(10.0, self.forward(z_phys))
 
     def get_config(self) -> dict:
+        """Return serialisable constructor arguments.
+
+        Returns
+        -------
+        dict
+            Dictionary with keys ``"logx_lo"``, ``"logx_hi"``,
+            ``"slope_scale"``, ``"logwidth_lo"``, ``"logwidth_hi"``,
+            ``"x0"``, and ``"eps"``.
+        """
         return dict(
             logx_lo=float(self.logx_lo),
             logx_hi=float(self.logx_hi),
@@ -355,7 +718,34 @@ class QuadraticDecoder(nn.Module, _XSetterMixin, DecoderConfigMixin):
     """
     paramnames = ["logA", "x_peak", "sigma"]
 
-    def __init__(self, logx_lo, logx_hi, x=None, *, logw_lo=-1.0, logw_hi=1.0, eps=1e-30):
+    def __init__(
+        self,
+        logx_lo: float,
+        logx_hi: float,
+        x: Optional[np.ndarray] = None,
+        *,
+        logw_lo: float = -1.0,
+        logw_hi: float = 1.0,
+        eps: float = 1e-30,
+    ) -> None:
+        """Initialise a log-quadratic peak decoder.
+
+        Parameters
+        ----------
+        logx_lo : float
+            Lower bound of the log10-peak-position range.
+        logx_hi : float
+            Upper bound of the log10-peak-position range.
+        x : array-like, optional
+            1-D x-grid on which the spectrum is evaluated. Can be set
+            later via ``decoder.x = new_grid``.
+        logw_lo : float, optional
+            Lower bound for the log10-width parameter. Default is ``-1.0``.
+        logw_hi : float, optional
+            Upper bound for the log10-width parameter. Default is ``1.0``.
+        eps : float, optional
+            Floor applied before ``log10``. Default is ``1e-30``.
+        """
         super().__init__()
         if x is not None:
             self._set_x(x)
@@ -367,6 +757,27 @@ class QuadraticDecoder(nn.Module, _XSetterMixin, DecoderConfigMixin):
         self.logx_hi = float(logx_hi)
 
     def normalize(self, y: np.ndarray, params: np.ndarray) -> dict:
+        """Compute normalisation statistics for the quadratic peak model.
+
+        Parameters
+        ----------
+        y : np.ndarray
+            Observed spectra (linear scale), shape ``(N, D)``.
+        params : np.ndarray
+            Physical input parameters, shape ``(N, P)``.
+
+        Returns
+        -------
+        dict
+            Nested dictionary with keys ``"params"``, ``"latent"``, and
+            ``"y"``.
+
+        Raises
+        ------
+        ValueError
+            If ``y`` or ``params`` are not 2-D, their leading dimensions
+            differ, or all amplitudes are non-finite.
+        """
         y = np.asarray(y, np.float64)
         params = np.asarray(params, np.float64)
         if y.ndim != 2 or params.ndim != 2 or y.shape[0] != params.shape[0]:
@@ -389,7 +800,26 @@ class QuadraticDecoder(nn.Module, _XSetterMixin, DecoderConfigMixin):
             "y": {"log": True, "eps": self.eps},
         }
 
-    def latent_to_params(self, z_phys: torch.Tensor):
+    def latent_to_params(
+        self, z_phys: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Map raw latent codes to physical quadratic-peak parameters.
+
+        Parameters
+        ----------
+        z_phys : torch.Tensor
+            Raw latent tensor of shape ``(N, 3)`` with columns
+            ``[logA, logxpeak_raw, logw_raw]``.
+
+        Returns
+        -------
+        logA : torch.Tensor
+            Log10-amplitude at the peak, shape ``(N,)``.
+        xpeak : torch.Tensor
+            Peak position in linear scale, shape ``(N,)``.
+        w : torch.Tensor
+            Width parameter in linear scale, shape ``(N,)``.
+        """
         z_phys = z_phys.to(torch.float64)
         logA = z_phys[:, 0]
 
@@ -402,6 +832,18 @@ class QuadraticDecoder(nn.Module, _XSetterMixin, DecoderConfigMixin):
         return logA, xpeak, w
 
     def forward(self, z_phys: torch.Tensor) -> torch.Tensor:
+        """Evaluate the quadratic peak model and return ``log10(y)``.
+
+        Parameters
+        ----------
+        z_phys : torch.Tensor
+            Raw latent tensor of shape ``(N, 3)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Log10-spectrum evaluated on the x-grid, shape ``(N, len(x))``.
+        """
         logA, xpeak, w = self.latent_to_params(z_phys)
         x = torch.clamp(self.x[None, :], min=1e-300)
         t = torch.log10(x / xpeak[:, None])
@@ -409,9 +851,30 @@ class QuadraticDecoder(nn.Module, _XSetterMixin, DecoderConfigMixin):
         return logy
 
     def evaluate(self, z_phys: torch.Tensor) -> torch.Tensor:
+        """Evaluate the quadratic peak model and return linear-scale ``y``.
+
+        Parameters
+        ----------
+        z_phys : torch.Tensor
+            Raw latent tensor of shape ``(N, 3)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Linear-scale spectrum evaluated on the x-grid,
+            shape ``(N, len(x))``.
+        """
         return torch.pow(10, self.forward(z_phys))
 
     def get_config(self) -> dict:
+        """Return serialisable constructor arguments.
+
+        Returns
+        -------
+        dict
+            Dictionary with keys ``"logx_lo"``, ``"logx_hi"``,
+            ``"logw_lo"``, ``"logw_hi"``, and ``"eps"``.
+        """
         return dict(
             logx_lo=float(self.logx_lo),
             logx_hi=float(self.logx_hi),
@@ -419,4 +882,3 @@ class QuadraticDecoder(nn.Module, _XSetterMixin, DecoderConfigMixin):
             logw_hi=float(self.logw_hi),
             eps=float(self.eps),
         )
-
