@@ -320,6 +320,111 @@ def soft_floor_torch(x: torch.Tensor, floor: torch.Tensor | float, k: float = 10
     return floor + torch.nn.functional.softplus(k * (x - floor)) / k
 
 
+def _build_latex_table(
+    nin: int,
+    nout: int,
+    shape: list[int],
+    acti: str,
+    n_context_params: int,
+    embed_dim: int,
+    context_acti: str,
+    dropout: float,
+    latent_dim: int,
+    decoder_class: str,
+    ydim: int,
+) -> str:
+    """Build a LaTeX table string describing the neural network architecture.
+
+    Parameters
+    ----------
+    nin : int
+        Total number of input parameters (inference + context).
+    nout : int
+        Latent dimension (encoder output).
+    shape : list[int]
+        Hidden layer widths of the main/encoder MLP.
+    acti : str
+        Activation function name for the main network.
+    n_context_params : int
+        Number of context parameters (0 for plain MLP).
+    embed_dim : int
+        Embedding dimension for the context encoder.
+    context_acti : str
+        Activation for the context encoder.
+    dropout : float
+        Dropout probability (0.0 means no dropout).
+    latent_dim : int
+        Dimension of the latent space.
+    decoder_class : str
+        Name of the decoder class.
+    ydim : int
+        Number of output (spectrum) bins.
+
+    Returns
+    -------
+    str
+        LaTeX table source code.
+    """
+    lines = []
+    lines.append(r"\begin{tabular}{lll}")
+    lines.append(r"\hline")
+    lines.append(r"\textbf{Layer} & \textbf{Nodes} & \textbf{Activation} \\")
+    lines.append(r"\hline")
+
+    n_inference = nin - n_context_params
+
+    if n_context_params > 0:
+        lines.append(r"\multicolumn{3}{l}{\textit{Input}} \\")
+        lines.append(f"Inference parameters & {n_inference} & -- \\\\")
+        lines.append(f"Context parameters & {n_context_params} & -- \\\\")
+        lines.append(r"\hline")
+
+        lines.append(r"\multicolumn{3}{l}{\textit{Context encoder}} \\")
+        prev = n_context_params
+        for width in shape[:1]:
+            lines.append(f"Linear layer & {width} & {context_acti} \\\\")
+            prev = width
+        lines.append(f"Linear layer (embedding) & {embed_dim} & -- \\\\")
+        lines.append(r"\hline")
+
+        lines.append(r"\multicolumn{3}{l}{\textit{Main encoder}} \\")
+        lines.append(f"Concatenated input (inference + embedding) & {n_inference + embed_dim} & -- \\\\")
+        prev = n_inference + embed_dim
+        for width in shape:
+            lines.append(f"Linear layer & {width} & {acti} \\\\")
+            if dropout > 0.0:
+                lines.append(f"Dropout & {width} & $p={dropout}$ \\\\")
+            prev = width
+        lines.append(f"Linear layer (latent) & {latent_dim} & -- \\\\")
+    else:
+        lines.append(r"\multicolumn{3}{l}{\textit{Input}} \\")
+        lines.append(f"Parameters & {nin} & -- \\\\")
+        lines.append(r"\hline")
+
+        lines.append(r"\multicolumn{3}{l}{\textit{Encoder}} \\")
+        prev = nin
+        for width in shape:
+            lines.append(f"Linear layer & {width} & {acti} \\\\")
+            if dropout > 0.0:
+                lines.append(f"Dropout & {width} & $p={dropout}$ \\\\")
+            prev = width
+        lines.append(f"Linear layer (latent) & {latent_dim} & -- \\\\")
+
+    lines.append(r"\hline")
+    lines.append(r"\multicolumn{3}{l}{\textit{Auxiliary parameters}} \\")
+    lines.append(f"Auxiliary parameters & {latent_dim} & -- \\\\")
+    lines.append(r"\hline")
+
+    dec_name = decoder_class.replace("Decoder", "")
+    lines.append(r"\multicolumn{3}{l}{\textit{Decoder (" + dec_name + r")}} \\")
+    lines.append(f"Spectrum output & {ydim} & -- \\\\")
+    lines.append(r"\hline")
+
+    lines.append(r"\end{tabular}")
+
+    return "\n".join(lines)
+
+
 class Emulator:
     def __init__(
         self,
@@ -476,7 +581,7 @@ class Emulator:
         """
         b = self.train_param_bounds
         if b is None or self.param_bounds_tol < 0:
-            return
+            return np.ones(len(P), dtype=bool)
         pmin = np.asarray(b["min"], dtype=np.float64).reshape(1, -1)
         pmax = np.asarray(b["max"], dtype=np.float64).reshape(1, -1)
         if P.shape[1] != pmin.shape[1]:
@@ -1055,6 +1160,51 @@ class Emulator:
             f"[P:{in_dim}]-[MLP:{enc_str}]->[latent:{latent_dim}]"
             f"-{dec_name}-[y:{ydim}]"
         )
+
+    def _save_latex_table(
+        self,
+        nin: int,
+        nout: int,
+        ydim: int,
+    ) -> None:
+        """Write a LaTeX table describing the architecture next to the model file.
+
+        The table file is placed alongside ``self.model_path`` with the
+        same stem and a ``.tex`` extension.
+
+        Parameters
+        ----------
+        nin : int
+            Total number of input parameters (inference + context).
+        nout : int
+            Latent dimension (encoder output).
+        ydim : int
+            Number of output (spectrum) bins.
+
+        Returns
+        -------
+        None
+        """
+        latent_dim = nout
+        decoder_class = self.decoder.__class__.__name__
+        tex = _build_latex_table(
+            nin=nin,
+            nout=nout,
+            shape=self.shape,
+            acti=self.acti,
+            n_context_params=self.n_context_params,
+            embed_dim=self.embed_dim,
+            context_acti=self.context_acti,
+            dropout=self.dropout,
+            latent_dim=latent_dim,
+            decoder_class=decoder_class,
+            ydim=ydim,
+        )
+        base, _ = os.path.splitext(self.model_path)
+        tex_path = base + ".tex"
+        with open(tex_path, "w") as f:
+            f.write(tex)
+            f.write("\n")
 
     # ---------- loss weighting ----------
 
@@ -1726,6 +1876,49 @@ class Emulator:
         if squeeze:
             result = {k: v[0] for k, v in result.items()}
         return result
+
+    def _run_decoder_on_latents(
+        self,
+        z_phys: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray | None]:
+        """Run the decoder on physical latent vectors and return (y_preds, dec_param_values).
+
+        This helper encapsulates all torch operations needed by
+        plot.plot_decoder_param_variations so that the plotting code does not
+        need to import torch directly.
+
+        Parameters
+        ----------
+        z_phys : np.ndarray
+            Physical latent vectors, shape ``(N, latent_dim)``.
+
+        Returns
+        -------
+        y_preds : np.ndarray
+            Decoder output in physical space, shape ``(N, y_dim)``.
+        dec_param_values : np.ndarray or None
+            If the decoder implements ``latent_to_params``, a 2-D array of
+            shape ``(N, n_dec_params)``; otherwise ``None``.
+        """
+        dec = self.decoder.to(self.device).double().eval()
+        norm = self._norm
+        is_log = bool(norm["y"].get("log", False))
+
+        zt = torch.tensor(z_phys, dtype=torch.float64, device=self.device)
+        with torch.no_grad():
+            y_log = dec(zt).detach().cpu().numpy()
+
+        y_preds = 10.0 ** y_log if is_log else y_log
+
+        dec_param_values = None
+        if hasattr(dec, "latent_to_params"):
+            with torch.no_grad():
+                pars = dec.latent_to_params(zt)
+                if isinstance(pars, tuple):
+                    pars = torch.stack(list(pars), dim=1)
+                dec_param_values = pars.detach().cpu().numpy()
+
+        return y_preds, dec_param_values
 
     def evaluate(
         self,
