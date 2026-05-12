@@ -471,3 +471,294 @@ def plot_decoder_param_corner_scatter(
 
     fig.tight_layout()
     return fig, axes
+
+
+def plot_emulator_param_variations(
+    emulator,
+    x: np.ndarray,
+    n_grid: int = 40,
+    n_sigma: float = 3.0,
+    yscale: str = "log",
+) -> dict[str, tuple[Figure, Axes]]:
+    """
+    For each input parameter, plot spectra as that parameter is varied over a
+    grid spanning +/- n_sigma from the parameter normalisation statistics,
+    while all other parameters are held at their centre values (normalisation
+    mean).
+
+    Parameters
+    ----------
+    emulator : Emulator
+        A loaded Emulator instance.
+    x : np.ndarray
+        1-D x-grid on which to evaluate the emulator.
+    n_grid : int, optional
+        Number of grid points to sample for the varied parameter.
+        Default is 40.
+    n_sigma : float, optional
+        Number of standard deviations around the normalisation mean to use
+        as the parameter range. Default is 3.0.
+    yscale : str, optional
+        Scale for the y-axis; ``"log"`` or ``"linear"``. Default is ``"log"``.
+
+    Returns
+    -------
+    dict[str, tuple[Figure, Axes]]
+        Dictionary mapping each parameter name to its ``(fig, ax)`` pair.
+    """
+    paramnames = emulator.paramnames
+    norm = emulator._norm
+    pn = norm["params"]
+    param_mean = np.asarray(pn["mean"], dtype=np.float64)
+    param_std = np.asarray(pn["std"], dtype=np.float64)
+
+    if paramnames is None:
+        paramnames = [f"p{i}" for i in range(len(param_mean))]
+
+    center_params = param_mean.copy()
+
+    xlabel = emulator._meta.get("xlabel", "x")
+    xunit = emulator._meta.get("xunit", "")
+    ylabel = emulator._meta.get("ylabel", "y")
+    yunit = emulator._meta.get("yunit", "")
+
+    if xunit:
+        xlabel_str = f"{xlabel} [{xunit}]"
+    else:
+        xlabel_str = xlabel
+
+    if yunit:
+        ylabel_str = f"{ylabel} [{yunit}]"
+    else:
+        ylabel_str = ylabel
+
+    cmap = plt.get_cmap("viridis")
+    figures = {}
+
+    center_y = emulator.transform(center_params[np.newaxis, :], x=x, return_latent_params=False)
+    center_y = np.asarray(center_y, float)[0]
+
+    train_bounds = emulator.train_param_bounds
+    if train_bounds is not None:
+        pmin_train = np.asarray(train_bounds["min"], dtype=np.float64)
+        pmax_train = np.asarray(train_bounds["max"], dtype=np.float64)
+    else:
+        pmin_train = None
+        pmax_train = None
+
+    for k, name in enumerate(paramnames):
+        lo = param_mean[k] - n_sigma * param_std[k]
+        hi = param_mean[k] + n_sigma * param_std[k]
+
+        if pmin_train is not None:
+            lo = max(lo, pmin_train[k])
+            hi = min(hi, pmax_train[k])
+
+        if lo >= hi:
+            lo = param_mean[k] - param_std[k]
+            hi = param_mean[k] + param_std[k]
+            if pmin_train is not None:
+                lo = max(lo, pmin_train[k])
+                hi = min(hi, pmax_train[k])
+
+        param_values = np.linspace(lo, hi, n_grid)
+
+        norm_colors = mpl.colors.Normalize(vmin=param_values[0], vmax=param_values[-1])
+        sm = mpl.cm.ScalarMappable(cmap=cmap, norm=norm_colors)
+        sm.set_array([])
+
+        fig, ax = plt.subplots(figsize=(6, 4))
+
+        all_params = np.tile(center_params, (n_grid, 1))
+        all_params[:, k] = param_values
+
+        if pmin_train is not None:
+            in_bounds_mask = np.all(
+                (all_params >= pmin_train[np.newaxis, :]) &
+                (all_params <= pmax_train[np.newaxis, :]),
+                axis=1,
+            )
+        else:
+            in_bounds_mask = np.ones(n_grid, dtype=bool)
+
+        valid_indices = np.where(in_bounds_mask)[0]
+
+        if len(valid_indices) == 0:
+            plt.close(fig)
+            continue
+
+        valid_params = all_params[valid_indices]
+        orig_policy = emulator.param_bounds_policy
+        emulator.param_bounds_policy = 'nan'
+        y_preds_valid = emulator.transform(valid_params, x=x, return_latent_params=False)
+        emulator.param_bounds_policy = orig_policy
+        y_preds_valid = np.asarray(y_preds_valid, float)
+
+        if yscale == "log":
+            ax.loglog(x, np.clip(center_y, 1e-300, None), color="black", lw=1.5, ls="-", zorder=5, label="central")
+        else:
+            ax.plot(x, center_y, color="black", lw=1.5, ls="-", zorder=5, label="central")
+        ax.set_xlim(*ax.get_xlim())
+        ax.set_ylim(*ax.get_ylim())
+
+        for idx_in_valid, j in enumerate(valid_indices):
+            pval = param_values[j]
+            color = cmap(norm_colors(pval))
+            y_pred = y_preds_valid[idx_in_valid]
+            if np.all(~np.isfinite(y_pred)):
+                continue
+            if yscale == "log":
+                ax.loglog(x, np.clip(y_pred, 1e-300, None), color=color, lw=2, alpha=0.8)
+            else:
+                ax.plot(x, y_pred, color=color, lw=2, alpha=0.8)
+
+        cbar = fig.colorbar(sm, ax=ax, orientation="horizontal", pad=0.18, aspect=40)
+        cbar.set_label(name)
+
+        ax.set_xlabel(xlabel_str)
+        ax.set_ylabel(ylabel_str)
+        ax.set_title(f"Varying {name}")
+        ax.grid(True, which="both", alpha=0.2)
+
+        fig.tight_layout()
+        figures[name] = (fig, ax)
+
+    return figures
+
+
+def plot_decoder_param_variations(
+    emulator,
+    x: np.ndarray,
+    n_grid: int = 40,
+    yscale: str = "log",
+) -> dict[str, tuple[Figure, Axes]]:
+    """
+    For each decoder (latent) parameter, plot spectra as that parameter is
+    varied over a grid from -5 to +5 in the raw latent space (i.e. as offsets
+    around the central z_phys value), while all other latent parameters are
+    held at their reference values predicted from the central input parameter
+    vector.  The colorbar shows the corresponding decoder output parameter
+    value.
+
+    Note: the variation grid is applied as offsets around center_z_phys[k],
+    so that the central curve always corresponds to offset=0 and all variation
+    curves are anchored relative to the predicted central latent vector.
+    This ensures logA (and other latent dimensions with large absolute values)
+    are varied around their actual predicted value rather than around zero.
+
+    Parameters
+    ----------
+    emulator : Emulator
+        A loaded Emulator instance whose decoder implements
+        ``latent_to_params``.
+    x : np.ndarray
+        1-D x-grid on which to evaluate the decoder.
+    n_grid : int, optional
+        Number of grid points along the varied latent dimension.
+        Default is 40.
+    yscale : str, optional
+        Scale for the y-axis; ``"log"`` or ``"linear"``. Default is ``"log"``.
+
+    Returns
+    -------
+    dict[str, tuple[Figure, Axes]]
+        Dictionary mapping each decoder parameter name to its
+        ``(fig, ax)`` pair.
+    """
+    norm = emulator._norm
+    pn = norm["params"]
+    param_mean = np.asarray(pn["mean"], dtype=np.float64)
+
+    center_params = param_mean.copy()
+
+    xlabel = emulator._meta.get("xlabel", "x")
+    xunit = emulator._meta.get("xunit", "")
+    ylabel = emulator._meta.get("ylabel", "y")
+    yunit = emulator._meta.get("yunit", "")
+
+    xlabel_str = f"{xlabel} [{xunit}]" if xunit else xlabel
+    ylabel_str = f"{ylabel} [{yunit}]" if yunit else ylabel
+
+    dec_paramnames = getattr(emulator.decoder, "paramnames", None)
+    latent_dim = getattr(emulator.decoder, "latent_dim", None)
+
+    center_z_phys = emulator.transform(
+        center_params[np.newaxis, :],
+        return_latent_params=False,
+    )
+    center_z_phys = np.asarray(center_z_phys, dtype=np.float64)
+    if center_z_phys.ndim == 1:
+        center_z_phys = center_z_phys[np.newaxis, :]
+
+    if latent_dim is None:
+        latent_dim = center_z_phys.shape[1]
+
+    if dec_paramnames is None or len(dec_paramnames) != latent_dim:
+        dec_paramnames = [f"z{i}" for i in range(latent_dim)]
+
+    # Variation offsets in z_phys space, centered on zero.
+    # Each dimension k is varied as: center_z_phys[0, k] + latent_offsets
+    # This ensures the central curve (offset=0) always overlaps with the
+    # predicted central spectrum regardless of the absolute scale of z_phys[k].
+    latent_offsets = np.linspace(-5.0, 5.0, n_grid)
+
+    cmap = plt.get_cmap("viridis")
+    figures = {}
+
+    emulator.decoder.x = np.asarray(x, dtype=np.float64)
+
+    center_y_preds, _ = emulator._run_decoder_on_latents(center_z_phys)
+    center_y = center_y_preds[0]
+
+    for k, latent_name in enumerate(dec_paramnames):
+        all_z_phys = np.tile(center_z_phys[0], (n_grid, 1))
+        # Vary dimension k as offsets around its central value
+        all_z_phys[:, k] = center_z_phys[0, k] + latent_offsets
+
+        y_preds, dec_param_arr = emulator._run_decoder_on_latents(all_z_phys)
+
+        if dec_param_arr is not None:
+            dec_param_values = dec_param_arr[:, k]
+        else:
+            dec_param_values = all_z_phys[:, k].copy()
+
+        pval_min = dec_param_values.min()
+        pval_max = dec_param_values.max()
+        if pval_min == pval_max:
+            pval_min = pval_min - 1.0
+            pval_max = pval_max + 1.0
+
+        norm_colors = mpl.colors.Normalize(vmin=pval_min, vmax=pval_max)
+        sm = mpl.cm.ScalarMappable(cmap=cmap, norm=norm_colors)
+        sm.set_array([])
+
+        fig, ax = plt.subplots(figsize=(6, 4))
+
+        if yscale == "log":
+            ax.loglog(x, np.clip(center_y, 1e-300, None), color="black", lw=1.5, ls="-", zorder=5, label="central")
+        else:
+            ax.plot(x, center_y, color="black", lw=1.5, ls="-", zorder=5, label="central")
+        ax.set_xlim(*ax.get_xlim())
+        ax.set_ylim(*ax.get_ylim())
+
+        for j in range(n_grid):
+            color = cmap(norm_colors(dec_param_values[j]))
+            y_pred = y_preds[j]
+            if yscale == "log":
+                ax.loglog(x, np.clip(y_pred, 1e-300, None), color=color, lw=2, alpha=0.8)
+            else:
+                ax.plot(x, y_pred, color=color, lw=2, alpha=0.8)
+
+        cbar = fig.colorbar(sm, ax=ax, orientation="horizontal", pad=0.18, aspect=40)
+        cbar.set_label(latent_name)
+
+        ax.set_xlabel(xlabel_str)
+        ax.set_ylabel(ylabel_str)
+        ax.set_title(f"Varying decoder param {latent_name}")
+        ax.grid(True, which="both", alpha=0.2)
+        ax.legend(fontsize=8)
+
+        fig.tight_layout()
+        figures[latent_name] = (fig, ax)
+
+    return figures
