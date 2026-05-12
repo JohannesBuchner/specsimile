@@ -98,15 +98,130 @@ class DecoderConfigMixin:
         return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
+def _normalize_params_stats(params: np.ndarray) -> dict:
+    """Compute normalisation statistics for physical parameters.
+
+    Parameters
+    ----------
+    params : np.ndarray
+        Physical input parameters, shape ``(N, P)``.
+
+    Returns
+    -------
+    dict
+        Dictionary with keys ``"log_mask"``, ``"mean"``, ``"std"``,
+        and ``"eps"``.
+    """
+    return {
+        "log_mask": np.zeros(params.shape[1], bool),
+        "mean": params.mean(axis=0),
+        "std": params.std(axis=0) + 1e-12,
+        "eps": 1e-30,
+    }
+
+
+def _normalize_amplitude_latent(latent_dim: int, ylog: np.ndarray) -> dict:
+    """Compute normalisation statistics for a latent space where the first
+    dimension encodes the log10-amplitude (peak value).
+
+    Parameters
+    ----------
+    latent_dim : int
+        Total number of latent dimensions.
+    ylog : np.ndarray
+        Log10-transformed spectra, shape ``(N, D)``.
+
+    Returns
+    -------
+    dict
+        Dictionary with keys ``"dim"``, ``"mean"``, ``"std"``, and
+        ``"log_mask"``.
+
+    Raises
+    ------
+    ValueError
+        If all per-sample peak amplitudes are non-finite.
+    """
+    amp = np.max(ylog, axis=1)
+    amp = amp[np.isfinite(amp)]
+    if len(amp) == 0:
+        raise ValueError("non-finite y in normalize")
+    latent_mean = np.zeros(latent_dim)
+    latent_std = np.ones(latent_dim)
+    latent_mean[0] = float(np.median(amp))
+    latent_std[0] = float(np.std(amp) + 1e-6)
+    return {
+        "dim": latent_dim,
+        "mean": latent_mean,
+        "std": latent_std,
+        "log_mask": np.zeros(latent_dim, bool),
+    }
+
+
+def _check_normalize_inputs(y: np.ndarray, params: np.ndarray) -> None:
+    """Validate shapes of ``y`` and ``params`` for ``normalize()``.
+
+    Parameters
+    ----------
+    y : np.ndarray
+        Observed spectra / outputs, shape ``(N, Y)``.
+    params : np.ndarray
+        Physical input parameters, shape ``(N, P)``.
+
+    Raises
+    ------
+    ValueError
+        If ``y`` or ``params`` are not 2-D, or their leading dimensions
+        differ.
+    """
+    if y.ndim != 2 or params.ndim != 2 or y.shape[0] != params.shape[0]:
+        raise ValueError("y must be (N,D), params must be (N,P) with same N")
+
+
+def _infer_logx_bounds_from_x(
+    x: np.ndarray,
+    logx_lo: Optional[float],
+    logx_hi: Optional[float],
+    current_lo: Optional[float],
+    current_hi: Optional[float],
+) -> Tuple[Optional[float], Optional[float]]:
+    """Infer missing log10 x-bounds from an x-grid array.
+
+    Parameters
+    ----------
+    x : np.ndarray
+        1-D x-grid array.
+    logx_lo : float or None
+        Explicitly supplied lower bound (takes priority).
+    logx_hi : float or None
+        Explicitly supplied upper bound (takes priority).
+    current_lo : float or None
+        Currently stored lower bound on the object.
+    current_hi : float or None
+        Currently stored upper bound on the object.
+
+    Returns
+    -------
+    tuple of (float or None, float or None)
+        Updated ``(logx_lo, logx_hi)`` with any inferrable values filled in.
+    """
+    x = np.asarray(x, float)
+    if logx_lo is None and current_lo is None:
+        logx_lo = float(np.log10(x.min()))
+    if logx_hi is None and current_hi is None:
+        logx_hi = float(np.log10(x.max()))
+    return logx_lo, logx_hi
+
+
 class DenseDecoder(nn.Module, DecoderConfigMixin):
     """latent_dim = y_dim ; forward(z)=z."""
 
-    def __init__(self, y_dim: int, paramnames: Optional[List[str]] = None) -> None:
+    def __init__(self, y_dim: Optional[int] = None, paramnames: Optional[List[str]] = None) -> None:
         """Initialise a pass-through dense decoder.
 
         Parameters
         ----------
-        y_dim : int
+        y_dim : int, optional
             Dimensionality of the output (and latent) space.
         paramnames : list of str, optional
             Names for each output parameter. Defaults to
@@ -119,6 +234,28 @@ class DenseDecoder(nn.Module, DecoderConfigMixin):
             ``y_dim``.
         """
         super().__init__()
+        if y_dim is not None:
+            self.configure(y_dim=y_dim, paramnames=paramnames)
+
+    def configure(self, y_dim: int, paramnames: List[str] = None, **kwargs) -> None:
+        """Configure the dense decoder after construction.
+
+        Parameters
+        ----------
+        y_dim : int
+            Dimensionality of the output (and latent) space.
+        paramnames : list of str, optional
+            Names for each output parameter. Defaults to
+            ``["y0", "y1", ...]`` when not provided.
+        **kwargs
+            Additional keyword arguments are accepted and ignored.
+
+        Raises
+        ------
+        ValueError
+            If ``paramnames`` is provided but its length differs from
+            ``y_dim``.
+        """
         self.y_dim = int(y_dim)
         self.latent_dim = self.y_dim
         if paramnames is None:
@@ -153,12 +290,19 @@ class DenseDecoder(nn.Module, DecoderConfigMixin):
         """
         y = np.asarray(y, dtype=np.float64)
         params = np.asarray(params, dtype=np.float64)
-        if y.ndim != 2 or params.ndim != 2 or y.shape[0] != params.shape[0]:
-            raise ValueError("y must be (N,Y), params must be (N,P) with same N")
+        _check_normalize_inputs(y, params)
+
+        if not hasattr(self, 'y_dim') or self.y_dim is None:
+            self.configure(y_dim=y.shape[1])
 
         return {
-            "params": {"log_mask": np.zeros(params.shape[1], bool), "mean": params.mean(axis=0), "std": params.std(axis=0) + 1e-12, "eps": 1e-30},
-            "latent": {"dim": self.latent_dim, "mean": y.mean(axis=0), "std": y.std(axis=0) + 1e-12, "log_mask": np.zeros(self.latent_dim, bool)},
+            "params": _normalize_params_stats(params),
+            "latent": {
+                "dim": self.latent_dim,
+                "mean": y.mean(axis=0),
+                "std": y.std(axis=0) + 1e-12,
+                "log_mask": np.zeros(self.latent_dim, bool),
+            },
             "y": {"log": False, "eps": 1e-30},
         }
 
@@ -208,12 +352,12 @@ class DenseDecoder(nn.Module, DecoderConfigMixin):
 class LogDenseDecoder(DenseDecoder):
     """latent_dim=y_dim ; forward(z)=z interpreted as log10(y)."""
 
-    def __init__(self, y_dim: int, eps: float = 1e-30, paramnames: Optional[List[str]] = None) -> None:
+    def __init__(self, y_dim: Optional[int] = None, eps: float = 1e-30, paramnames: Optional[List[str]] = None) -> None:
         """Initialise a log-space dense decoder.
 
         Parameters
         ----------
-        y_dim : int
+        y_dim : int, optional
             Dimensionality of the output (and latent) space.
         eps : float, optional
             Small floor applied before taking ``log10`` to avoid
@@ -222,10 +366,30 @@ class LogDenseDecoder(DenseDecoder):
             Names for each output parameter. Defaults to
             ``["logy0", "logy1", ...]`` when not provided.
         """
-        super().__init__(
+        self.eps = float(eps)
+        if y_dim is not None:
+            super().__init__(
+                y_dim=y_dim,
+                paramnames=paramnames or [f"logy{i}" for i in range(y_dim)])
+        else:
+            super().__init__()
+
+    def configure(self, y_dim: int, paramnames: List[str] = None, **kwargs) -> None:
+        """Configure the log-space dense decoder after construction.
+
+        Parameters
+        ----------
+        y_dim : int
+            Dimensionality of the output (and latent) space.
+        paramnames : list of str, optional
+            Names for each output parameter. Defaults to
+            ``["logy0", "logy1", ...]`` when not provided.
+        **kwargs
+            Additional keyword arguments are accepted and ignored.
+        """
+        super().configure(
             y_dim=y_dim,
             paramnames=paramnames or [f"logy{i}" for i in range(y_dim)])
-        self.eps = float(eps)
 
     def normalize(self, y: np.ndarray, params: np.ndarray) -> dict:
         """Compute normalisation statistics in log10 space.
@@ -251,13 +415,20 @@ class LogDenseDecoder(DenseDecoder):
         """
         y = np.asarray(y, dtype=np.float64)
         params = np.asarray(params, dtype=np.float64)
-        if y.ndim != 2 or params.ndim != 2 or y.shape[0] != params.shape[0]:
-            raise ValueError("y must be (N,Y), params must be (N,P) with same N")
+        _check_normalize_inputs(y, params)
+
+        if not hasattr(self, 'y_dim') or self.y_dim is None:
+            self.configure(y_dim=y.shape[1])
 
         ylog = np.log10(np.clip(y, self.eps, None))
         return {
-            "params": {"log_mask": np.zeros(params.shape[1], bool), "mean": params.mean(axis=0), "std": params.std(axis=0) + 1e-12, "eps": 1e-30},
-            "latent": {"dim": self.latent_dim, "mean": ylog.mean(axis=0), "std": ylog.std(axis=0) + 1e-12, "log_mask": np.zeros(self.latent_dim, bool)},
+            "params": _normalize_params_stats(params),
+            "latent": {
+                "dim": self.latent_dim,
+                "mean": ylog.mean(axis=0),
+                "std": ylog.std(axis=0) + 1e-12,
+                "log_mask": np.zeros(self.latent_dim, bool),
+            },
             "y": {"log": True, "eps": self.eps},
         }
 
@@ -336,8 +507,6 @@ class CutoffPLDecoder(nn.Module, _XSetterMixin, DecoderConfigMixin):
             Default is ``1e-30``.
         """
         super().__init__()
-        if x is not None:
-            self._set_x(x)
         self.eps = float(eps)
         self.latent_dim = 3
 
@@ -345,6 +514,51 @@ class CutoffPLDecoder(nn.Module, _XSetterMixin, DecoderConfigMixin):
         self.gamma_hi = float(gamma_hi)
         self.logxcut_lo = float(np.log10(xcut_lo))
         self.logxcut_hi = float(np.log10(xcut_hi))
+        if x is not None:
+            self._set_x(x)
+
+    def configure(
+        self,
+        *,
+        x: Optional[np.ndarray] = None,
+        gamma_lo: Optional[float] = None,
+        gamma_hi: Optional[float] = None,
+        xcut_lo: Optional[float] = None,
+        xcut_hi: Optional[float] = None,
+        eps: Optional[float] = None,
+        **kwargs,
+    ) -> None:
+        """Configure the cutoff power-law decoder after construction.
+
+        Parameters
+        ----------
+        x : array-like, optional
+            1-D x-grid on which the spectrum is evaluated.
+        gamma_lo : float, optional
+            Lower bound for the squashed spectral index ``gamma``.
+        gamma_hi : float, optional
+            Upper bound for the squashed spectral index ``gamma``.
+        xcut_lo : float, optional
+            Lower physical bound for the cutoff ``xcut`` (linear scale).
+        xcut_hi : float, optional
+            Upper physical bound for the cutoff ``xcut`` (linear scale).
+        eps : float, optional
+            Floor applied before ``log10`` to avoid ``log(0)``.
+        **kwargs
+            Additional keyword arguments are accepted and ignored.
+        """
+        if x is not None:
+            self._set_x(x)
+        if eps is not None:
+            self.eps = float(eps)
+        if gamma_lo is not None:
+            self.gamma_lo = float(gamma_lo)
+        if gamma_hi is not None:
+            self.gamma_hi = float(gamma_hi)
+        if xcut_lo is not None:
+            self.logxcut_lo = float(np.log10(xcut_lo))
+        if xcut_hi is not None:
+            self.logxcut_hi = float(np.log10(xcut_hi))
 
     def normalize(self, y: np.ndarray, params: np.ndarray) -> dict:
         """Compute normalisation statistics for the cutoff power-law model.
@@ -370,23 +584,11 @@ class CutoffPLDecoder(nn.Module, _XSetterMixin, DecoderConfigMixin):
         """
         y = np.asarray(y, np.float64)
         params = np.asarray(params, np.float64)
-        if y.ndim != 2 or params.ndim != 2 or y.shape[0] != params.shape[0]:
-            raise ValueError("y must be (N,D), params must be (N,P) with same N")
-
+        _check_normalize_inputs(y, params)
         ylog = np.log10(np.clip(y, self.eps, None))
-        amp = np.max(ylog, axis=1)
-        amp = amp[np.isfinite(amp)]
-        if len(amp) == 0:
-            raise ValueError("non-finite y in normalize")
-
-        latent_mean = np.zeros(self.latent_dim)
-        latent_std = np.ones(self.latent_dim)
-        latent_mean[0] = float(np.median(amp))
-        latent_std[0] = float(np.std(amp) + 1e-6)
-
         return {
-            "params": {"log_mask": np.zeros(params.shape[1], bool), "mean": params.mean(axis=0), "std": params.std(axis=0) + 1e-12, "eps": 1e-30},
-            "latent": {"dim": self.latent_dim, "mean": latent_mean, "std": latent_std, "log_mask": np.zeros(self.latent_dim, bool)},
+            "params": _normalize_params_stats(params),
+            "latent": _normalize_amplitude_latent(self.latent_dim, ylog),
             "y": {"log": True, "eps": self.eps},
         }
 
@@ -488,8 +690,8 @@ class SBPLDecoder(nn.Module, _XSetterMixin, DecoderConfigMixin):
 
     def __init__(
         self,
-        logx_lo: float,
-        logx_hi: float,
+        logx_lo: Optional[float] = None,
+        logx_hi: Optional[float] = None,
         *,
         x: Optional[np.ndarray] = None,
         x0: Optional[float] = None,
@@ -502,10 +704,12 @@ class SBPLDecoder(nn.Module, _XSetterMixin, DecoderConfigMixin):
 
         Parameters
         ----------
-        logx_lo : float
-            Lower bound of the log10-break-position range.
-        logx_hi : float
-            Upper bound of the log10-break-position range.
+        logx_lo : float, optional
+            Lower bound of the log10-break-position range. Inferred from
+            ``x`` if not provided.
+        logx_hi : float, optional
+            Upper bound of the log10-break-position range. Inferred from
+            ``x`` if not provided.
         x : array-like, optional
             1-D x-grid on which the spectrum is evaluated. Can be set
             later via ``decoder.x = new_grid``.
@@ -525,22 +729,102 @@ class SBPLDecoder(nn.Module, _XSetterMixin, DecoderConfigMixin):
             Floor applied before ``log10``. Default is ``1e-30``.
         """
         super().__init__()
-        if x is not None:
-            self._set_x(x)
-        if x0 is not None:
-            self.register_buffer("_x0", torch.tensor(float(x0), dtype=torch.float64))
         self.slope_scale = float(slope_scale)
         self.logwidth_lo = float(logwidth_lo)
         self.logwidth_hi = float(logwidth_hi)
         self.eps = float(eps)
         self.latent_dim = 5
-        self.logx_lo = float(logx_lo)
-        self.logx_hi = float(logx_hi)
+        self.logx_lo = None
+        self.logx_hi = None
+        if x is not None:
+            self._set_x(x)
+            logx_lo, logx_hi = _infer_logx_bounds_from_x(x, logx_lo, logx_hi, self.logx_lo, self.logx_hi)
+        if logx_lo is not None:
+            self.logx_lo = float(logx_lo)
+        if logx_hi is not None:
+            self.logx_hi = float(logx_hi)
+        if x0 is not None:
+            self.register_buffer("_x0", torch.tensor(float(x0), dtype=torch.float64))
+
+    def configure(
+        self,
+        *,
+        x: Optional[np.ndarray] = None,
+        logx_lo: Optional[float] = None,
+        logx_hi: Optional[float] = None,
+        x0: Optional[float] = None,
+        slope_scale: Optional[float] = None,
+        logwidth_lo: Optional[float] = None,
+        logwidth_hi: Optional[float] = None,
+        eps: Optional[float] = None,
+        **kwargs,
+    ) -> None:
+        """Configure the SBPL decoder after construction.
+
+        Parameters
+        ----------
+        x : array-like, optional
+            1-D x-grid on which the spectrum is evaluated.
+        logx_lo : float, optional
+            Lower bound of the log10-break-position range. Inferred from
+            ``x`` if not provided.
+        logx_hi : float, optional
+            Upper bound of the log10-break-position range. Inferred from
+            ``x`` if not provided.
+        x0 : float, optional
+            Pivot point at which ``y(x0) = 10**lognorm``.
+        slope_scale : float, optional
+            Scaling factor applied to ``asinh`` of the raw slope parameters.
+        logwidth_lo : float, optional
+            Lower bound for the log10-width of the transition region.
+        logwidth_hi : float, optional
+            Upper bound for the log10-width of the transition region.
+        eps : float, optional
+            Floor applied before ``log10``.
+        **kwargs
+            Additional keyword arguments are accepted and ignored.
+        """
+        if x is not None:
+            self._set_x(x)
+            logx_lo, logx_hi = _infer_logx_bounds_from_x(x, logx_lo, logx_hi, self.logx_lo, self.logx_hi)
+        if logx_lo is not None:
+            self.logx_lo = float(logx_lo)
+        if logx_hi is not None:
+            self.logx_hi = float(logx_hi)
+        if x0 is not None:
+            self.register_buffer("_x0", torch.tensor(float(x0), dtype=torch.float64))
+        if slope_scale is not None:
+            self.slope_scale = float(slope_scale)
+        if logwidth_lo is not None:
+            self.logwidth_lo = float(logwidth_lo)
+        if logwidth_hi is not None:
+            self.logwidth_hi = float(logwidth_hi)
+        if eps is not None:
+            self.eps = float(eps)
 
     @property
     def x0(self) -> Optional[torch.Tensor]:
         """torch.Tensor or None: Registered pivot point buffer (scalar, float64)."""
         return getattr(self, '_x0', None)
+
+    def _ensure_logx_bounds(self) -> None:
+        """Infer logx bounds from the registered x-grid if not yet set.
+
+        Raises
+        ------
+        ValueError
+            If ``logx_lo`` or ``logx_hi`` are missing and no x-grid is
+            available to infer them from.
+        """
+        if self.logx_lo is None or self.logx_hi is None:
+            if hasattr(self, '_x') and self._x is not None:
+                xarr = self._x.detach().cpu().numpy()
+                if self.logx_lo is None:
+                    self.logx_lo = float(np.log10(xarr.min()))
+                if self.logx_hi is None:
+                    self.logx_hi = float(np.log10(xarr.max()))
+            else:
+                raise ValueError("logx_lo and logx_hi must be set before normalize()")
 
     def normalize(self, y: np.ndarray, params: np.ndarray) -> dict:
         """Compute normalisation statistics for the SBPL model.
@@ -566,23 +850,12 @@ class SBPLDecoder(nn.Module, _XSetterMixin, DecoderConfigMixin):
         """
         y = np.asarray(y, np.float64)
         params = np.asarray(params, np.float64)
-        if y.ndim != 2 or params.ndim != 2 or y.shape[0] != params.shape[0]:
-            raise ValueError("y must be (N,D), params must be (N,P) with same N")
-
+        _check_normalize_inputs(y, params)
+        self._ensure_logx_bounds()
         ylog = np.log10(np.clip(y, self.eps, None))
-        amp = np.max(ylog, axis=1)
-        amp = amp[np.isfinite(amp)]
-        if len(amp) == 0:
-            raise ValueError("non-finite y in normalize")
-
-        latent_mean = np.zeros(self.latent_dim)
-        latent_std = np.ones(self.latent_dim)
-        latent_mean[0] = float(np.median(amp))
-        latent_std[0] = float(np.std(amp) + 1e-6)
-
         return {
-            "params": {"log_mask": np.zeros(params.shape[1], bool), "mean": params.mean(axis=0), "std": params.std(axis=0) + 1e-12, "eps": 1e-30},
-            "latent": {"dim": self.latent_dim, "mean": latent_mean, "std": latent_std, "log_mask": np.zeros(self.latent_dim, bool)},
+            "params": _normalize_params_stats(params),
+            "latent": _normalize_amplitude_latent(self.latent_dim, ylog),
             "y": {"log": True, "eps": self.eps},
         }
 
@@ -720,8 +993,8 @@ class QuadraticDecoder(nn.Module, _XSetterMixin, DecoderConfigMixin):
 
     def __init__(
         self,
-        logx_lo: float,
-        logx_hi: float,
+        logx_lo: Optional[float] = None,
+        logx_hi: Optional[float] = None,
         x: Optional[np.ndarray] = None,
         *,
         logw_lo: float = -1.0,
@@ -732,10 +1005,12 @@ class QuadraticDecoder(nn.Module, _XSetterMixin, DecoderConfigMixin):
 
         Parameters
         ----------
-        logx_lo : float
-            Lower bound of the log10-peak-position range.
-        logx_hi : float
-            Upper bound of the log10-peak-position range.
+        logx_lo : float, optional
+            Lower bound of the log10-peak-position range. Inferred from
+            ``x`` if not provided.
+        logx_hi : float, optional
+            Upper bound of the log10-peak-position range. Inferred from
+            ``x`` if not provided.
         x : array-like, optional
             1-D x-grid on which the spectrum is evaluated. Can be set
             later via ``decoder.x = new_grid``.
@@ -747,14 +1022,84 @@ class QuadraticDecoder(nn.Module, _XSetterMixin, DecoderConfigMixin):
             Floor applied before ``log10``. Default is ``1e-30``.
         """
         super().__init__()
-        if x is not None:
-            self._set_x(x)
         self.logw_lo = float(logw_lo)
         self.logw_hi = float(logw_hi)
         self.eps = float(eps)
         self.latent_dim = 3
-        self.logx_lo = float(logx_lo)
-        self.logx_hi = float(logx_hi)
+        self.logx_lo = None
+        self.logx_hi = None
+        if x is not None:
+            self._set_x(x)
+            logx_lo, logx_hi = _infer_logx_bounds_from_x(x, logx_lo, logx_hi, self.logx_lo, self.logx_hi)
+        if logx_lo is not None:
+            self.logx_lo = float(logx_lo)
+        if logx_hi is not None:
+            self.logx_hi = float(logx_hi)
+
+    def configure(
+        self,
+        *,
+        x: Optional[np.ndarray] = None,
+        logx_lo: Optional[float] = None,
+        logx_hi: Optional[float] = None,
+        logw_lo: Optional[float] = None,
+        logw_hi: Optional[float] = None,
+        eps: Optional[float] = None,
+        **kwargs,
+    ) -> None:
+        """Configure the quadratic peak decoder after construction.
+
+        Parameters
+        ----------
+        x : array-like, optional
+            1-D x-grid on which the spectrum is evaluated.
+        logx_lo : float, optional
+            Lower bound of the log10-peak-position range. Inferred from
+            ``x`` if not provided.
+        logx_hi : float, optional
+            Upper bound of the log10-peak-position range. Inferred from
+            ``x`` if not provided.
+        logw_lo : float, optional
+            Lower bound for the log10-width parameter.
+        logw_hi : float, optional
+            Upper bound for the log10-width parameter.
+        eps : float, optional
+            Floor applied before ``log10``.
+        **kwargs
+            Additional keyword arguments are accepted and ignored.
+        """
+        if x is not None:
+            self._set_x(x)
+            logx_lo, logx_hi = _infer_logx_bounds_from_x(x, logx_lo, logx_hi, self.logx_lo, self.logx_hi)
+        if logx_lo is not None:
+            self.logx_lo = float(logx_lo)
+        if logx_hi is not None:
+            self.logx_hi = float(logx_hi)
+        if logw_lo is not None:
+            self.logw_lo = float(logw_lo)
+        if logw_hi is not None:
+            self.logw_hi = float(logw_hi)
+        if eps is not None:
+            self.eps = float(eps)
+
+    def _ensure_logx_bounds(self) -> None:
+        """Infer logx bounds from the registered x-grid if not yet set.
+
+        Raises
+        ------
+        ValueError
+            If ``logx_lo`` or ``logx_hi`` are missing and no x-grid is
+            available to infer them from.
+        """
+        if self.logx_lo is None or self.logx_hi is None:
+            if hasattr(self, '_x') and self._x is not None:
+                xarr = self._x.detach().cpu().numpy()
+                if self.logx_lo is None:
+                    self.logx_lo = float(np.log10(xarr.min()))
+                if self.logx_hi is None:
+                    self.logx_hi = float(np.log10(xarr.max()))
+            else:
+                raise ValueError("logx_lo and logx_hi must be set before normalize()")
 
     def normalize(self, y: np.ndarray, params: np.ndarray) -> dict:
         """Compute normalisation statistics for the quadratic peak model.
@@ -780,23 +1125,12 @@ class QuadraticDecoder(nn.Module, _XSetterMixin, DecoderConfigMixin):
         """
         y = np.asarray(y, np.float64)
         params = np.asarray(params, np.float64)
-        if y.ndim != 2 or params.ndim != 2 or y.shape[0] != params.shape[0]:
-            raise ValueError("y must be (N,D), params must be (N,P) with same N")
-
+        _check_normalize_inputs(y, params)
+        self._ensure_logx_bounds()
         ylog = np.log10(np.clip(y, self.eps, None))
-        amp = np.max(ylog, axis=1)
-        amp = amp[np.isfinite(amp)]
-        if len(amp) == 0:
-            raise ValueError("non-finite y in normalize")
-
-        latent_mean = np.zeros(self.latent_dim)
-        latent_std = np.ones(self.latent_dim)
-        latent_mean[0] = float(np.median(amp))
-        latent_std[0] = float(np.std(amp) + 1e-6)
-
         return {
-            "params": {"log_mask": np.zeros(params.shape[1], bool), "mean": params.mean(axis=0), "std": params.std(axis=0) + 1e-12, "eps": 1e-30},
-            "latent": {"dim": self.latent_dim, "mean": latent_mean, "std": latent_std, "log_mask": np.zeros(self.latent_dim, bool)},
+            "params": _normalize_params_stats(params),
+            "latent": _normalize_amplitude_latent(self.latent_dim, ylog),
             "y": {"log": True, "eps": self.eps},
         }
 
