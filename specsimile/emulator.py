@@ -1724,6 +1724,7 @@ class Emulator:
             ylabel=dataset.ylabel,
             xunit=dataset.xunit,
             yunit=dataset.yunit,
+            x_grid=x.tolist(),
             decoder_paramnames=getattr(self.decoder, "paramnames", None),
             decoder=dict(
                 class_name=self.decoder.__class__.__name__,

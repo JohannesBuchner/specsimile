@@ -172,16 +172,26 @@ def _build_sliders_from_emulator(emu) -> list:
 
 def _infer_x_grid(emu) -> np.ndarray:
     """
-    Return the x grid from the decoder buffer if available, else reconstruct
-    from the decoder config or fall back to a linear grid of 256 points.
+    Return the x grid from the emulator checkpoint metadata if available,
+    then from the decoder buffer, then reconstruct from decoder config,
+    or fall back to a linear grid of 256 points.
     """
+    # First priority: x_grid stored in checkpoint metadata
+    meta = emu._meta or {}
+    x_grid_meta = meta.get("x_grid", None)
+    if x_grid_meta is not None:
+        x = np.asarray(x_grid_meta, dtype=np.float64)
+        if x.ndim == 1 and len(x) > 1:
+            return x
+
+    # Second priority: decoder buffer
     decoder = emu.decoder
     if hasattr(decoder, "_x") and decoder._x is not None:
         x = decoder._x.detach().cpu().numpy()
         if len(x) > 1:
             return x
 
-    # Try to read from decoder config (SBPLDecoder / QuadraticDecoder store logx bounds)
+    # Third priority: decoder config bounds
     cfg = {}
     if hasattr(decoder, "get_config"):
         cfg = decoder.get_config()
