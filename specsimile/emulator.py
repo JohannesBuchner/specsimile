@@ -1495,6 +1495,9 @@ class Emulator:
             )
 
         n = len(dataset)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
         rng = np.random.default_rng(seed)
         idx = rng.permutation(n)
         ntr = max(1, int(round(train_split * n)))
