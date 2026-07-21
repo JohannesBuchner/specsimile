@@ -12,7 +12,7 @@ import torch
 # Part 2: Extract weights from PyTorch emulator models (specsimile)
 # ============================================================================
 
-def extract_pytorch_emulator_weights(model_path: str, verbose: bool = True) -> Dict[str, np.ndarray]:
+def extract_pytorch_emulator_weights(model_path: str, verbose: bool = True) -> tuple:
     """
     Extract weights from a specsimile Emulator saved as a PyTorch checkpoint.
 
@@ -29,6 +29,8 @@ def extract_pytorch_emulator_weights(model_path: str, verbose: bool = True) -> D
     result : dict of str to np.ndarray
         Dictionary mapping parameter names to numpy arrays, plus metadata
         entries (e.g. '_norm', 'decoder_type', 'paramnames', etc.).
+    checkpoint : dict
+        The raw checkpoint dictionary as loaded by torch.load.
     """
     checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
     result = {}
@@ -88,7 +90,7 @@ def extract_pytorch_emulator_weights(model_path: str, verbose: bool = True) -> D
                 if verbose:
                     print(f"      norm[{nk}] = {type(nv).__name__} {nv}")
     
-    return result
+    return result, checkpoint
 
 def jax_encoder_forward(x: jnp.ndarray, bundle: dict, prefix: str) -> jnp.ndarray:
     """
@@ -128,7 +130,7 @@ def jax_encoder_forward(x: jnp.ndarray, bundle: dict, prefix: str) -> jnp.ndarra
 
     n_context = bundle.get(f'{p}n_context_params', 0)
 
-    acti_name = bundle.get(f'{p}acti', 'LeakyReLU')
+    acti_name = bundle[f'{p}acti']
     ctx_acti_name = bundle.get(f'{p}context_acti', 'ReLU')
     if n_context > 0:
         # ConditionalMLP: split context and inference parts
@@ -461,7 +463,7 @@ def load_decoder_bundle(path: str, prefix: str = '', verbose: bool = False) -> d
         scalars/booleans.
     """
     p = f'{prefix}_' if prefix else ''
-    emu_weights = extract_pytorch_emulator_weights(path, verbose=verbose)
+    emu_weights, ckpt_raw = extract_pytorch_emulator_weights(path, verbose=verbose)
     bundle = {}
 
     # --- MLP weights --------------------------------------------------------
@@ -474,7 +476,6 @@ def load_decoder_bundle(path: str, prefix: str = '', verbose: bool = False) -> d
     has_conditional = any(k.startswith('main_net.') for k in emu_weights if isinstance(emu_weights[k], np.ndarray))
 
     # Read n_context_params from checkpoint if present
-    ckpt_raw = torch.load(path, map_location='cpu', weights_only=False)
     acti_name = ckpt_raw.get('acti', 'LeakyReLU')
     context_acti_name = ckpt_raw.get('context_acti', 'ReLU')
     bundle[f'{p}acti'] = acti_name
