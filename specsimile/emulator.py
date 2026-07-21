@@ -1648,7 +1648,10 @@ class Emulator:
                 z_phys = z_norm * lat_std + lat_mean
                 y_pre = dec(z_phys)
                 y_hat = (y_pre - y_mean) / y_std
-                vloss = self.loss_fn(y_hat, Tva).item() ** 2
+                val_rms_per_sample = self.rms_per_sample_torch(y_hat, Tva)
+                vloss = val_rms_per_sample.mean().item() ** 2
+                val_rmse = val_rms_per_sample.mean().item()
+                val_p95 = float(torch.quantile(val_rms_per_sample, 0.95).item())
 
             if self.smooth_weight > 0.0:
                 # No torch.no_grad() here: _taylor_consistency_penalty needs
@@ -1669,13 +1672,13 @@ class Emulator:
                     ).item()
                 vtotal = vloss + self.smooth_weight * vsmooth
                 loss_str = (
-                    f"MSE={vloss:.3f}  "
+                    f"MSE={vloss:.3f}  RMSE={val_rmse:.3f} (95%={val_p95:.3f})  "
                     f"+smooth={vsmooth:.3f} * {self.smooth_weight} -> "
                     f"{vtotal:.3f}"
                 )
             else:
                 vtotal = vloss
-                loss_str = f"MSE={vloss:.3f}"
+                loss_str = f"MSE={vloss:.3f}  RMSE={val_rmse:.3f} (95%={val_p95:.3f})"
 
             if vtotal < best - patience_min_loss_difference:
                 best = vtotal
