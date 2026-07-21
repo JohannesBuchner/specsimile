@@ -109,3 +109,5 @@ ENV/
 *.npz
 
 README.html
+*.proposed
+*.orig
