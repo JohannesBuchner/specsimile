@@ -1216,3 +1216,333 @@ class QuadraticDecoder(nn.Module, _XSetterMixin, DecoderConfigMixin):
             logw_hi=float(self.logw_hi),
             eps=float(self.eps),
         )
+
+
+class ModifiedBlackbodyDecoder(nn.Module, _XSetterMixin, DecoderConfigMixin):
+    """
+    Modified blackbody (greybody) spectrum decoder on an x-grid (frequencies),
+    returning log10(y).
+
+    The model is:
+
+      B(nu, T) = (2 h nu^3 / c^2) / (exp(h nu / k_B T) - 1)   [Planck function]
+      S(nu) = A * (nu / nu0)^beta * B(nu, T)
+
+    where ``nu`` plays the role of ``x`` (the grid), ``T`` is the dust
+    temperature, ``beta`` is the emissivity spectral index, ``A`` is an
+    overall amplitude, and ``nu0`` is a pivot frequency used to separate
+    the normalisation from the beta-slope.
+
+    To keep the decoder unit-agnostic the Planck function is evaluated in
+    *dimensionless* form via the substitution ``u = h nu / k_B T``:
+
+      B(nu, T)  ∝  nu^3 / (exp(u) - 1)
+
+    so the full model in log10 is:
+
+      log10 S = logA + beta * log10(nu/nu0) + 3*log10(nu) - log10(exp(u)-1)
+                + const
+
+    The proportionality constant is absorbed into ``logA``.
+
+    Physical latent parameters (3 total):
+      z_phys = [logA, logT_raw, beta_raw]
+
+    Mappings:
+      logA   – free (amplitude at pivot)
+      T      = 10**squash(logT_raw, logT_lo, logT_hi)   [dust temperature]
+      beta   = squash(beta_raw, beta_lo, beta_hi)         [emissivity index]
+
+    The ``x`` grid is interpreted as frequencies in whatever units the user
+    provides; only ratios ``x / nu0`` and ``u = hnu/kT`` (both dimensionless
+    when consistent units are used) appear in the model. When ``hk`` is set
+    to ``h/k_B`` in units matching the x-grid, the Planck exponential is
+    computed correctly; otherwise the user may pass ``hk=1`` and supply
+    ``x`` already in units of ``k_B T / h`` (i.e. ``x`` is dimensionless
+    frequency).
+
+    Parameters
+    ----------
+    x : array-like, optional
+        1-D frequency grid. Can be set later via ``decoder.x = new_grid``.
+    nu0 : float, optional
+        Pivot frequency used to normalise the power-law factor ``(nu/nu0)**beta``.
+        Defaults to the geometric mean of the x-grid when first set.
+    hk : float, optional
+        Ratio ``h / k_B`` in units consistent with the x-grid.
+        Default is ``1.0`` (dimensionless / pre-normalised x).
+    logT_lo : float, optional
+        Lower bound of log10(T). Default is ``0.0`` (T=1).
+    logT_hi : float, optional
+        Upper bound of log10(T). Default is ``3.0`` (T=1000).
+    beta_lo : float, optional
+        Lower bound of the emissivity index. Default is ``0.5``.
+    beta_hi : float, optional
+        Upper bound of the emissivity index. Default is ``4.0``.
+    eps : float, optional
+        Floor applied before ``log10``. Default is ``1e-30``.
+    """
+
+    paramnames = ["logA", "T", "beta"]
+
+    def __init__(
+        self,
+        *,
+        x: Optional[np.ndarray] = None,
+        nu0: Optional[float] = None,
+        hk: float = 1.0,
+        logT_lo: float = 0.0,
+        logT_hi: float = 3.0,
+        beta_lo: float = 0.5,
+        beta_hi: float = 4.0,
+        eps: float = 1e-30,
+    ) -> None:
+        """Initialise a modified blackbody decoder.
+
+        Parameters
+        ----------
+        x : array-like, optional
+            1-D frequency grid on which the spectrum is evaluated. Can be
+            set later via ``decoder.x = new_grid``.
+        nu0 : float, optional
+            Pivot frequency for the ``(nu/nu0)**beta`` power-law factor.
+            Defaults to the geometric mean of the x-grid when first set.
+        hk : float, optional
+            ``h / k_B`` in units consistent with the x-grid. Default ``1.0``.
+        logT_lo : float, optional
+            Lower bound of log10(T). Default ``0.0``.
+        logT_hi : float, optional
+            Upper bound of log10(T). Default ``3.0``.
+        beta_lo : float, optional
+            Lower bound of the emissivity index beta. Default ``0.5``.
+        beta_hi : float, optional
+            Upper bound of the emissivity index beta. Default ``4.0``.
+        eps : float, optional
+            Floor applied before ``log10``. Default ``1e-30``.
+        """
+        super().__init__()
+        self.hk = float(hk)
+        self.logT_lo = float(logT_lo)
+        self.logT_hi = float(logT_hi)
+        self.beta_lo = float(beta_lo)
+        self.beta_hi = float(beta_hi)
+        self.eps = float(eps)
+        self.latent_dim = 3
+        self._nu0 = nu0  # store raw; converted to buffer when x is set
+
+        if x is not None:
+            self._set_x(x)
+            self._init_nu0(nu0)
+
+    def _init_nu0(self, nu0: Optional[float]) -> None:
+        """Set the pivot-frequency buffer, defaulting to geometric mean of x.
+
+        Parameters
+        ----------
+        nu0 : float or None
+            Explicit pivot frequency. If ``None``, uses geometric mean of
+            the current x-grid.
+        """
+        if nu0 is None:
+            xarr = self._x.detach().cpu().numpy()
+            nu0 = float(np.exp(np.mean(np.log(np.clip(xarr, 1e-300, None)))))
+        buf = torch.tensor(float(nu0), dtype=torch.float64)
+        if hasattr(self, "_nu0_buf"):
+            self._buffers["_nu0_buf"] = buf
+        else:
+            self.register_buffer("_nu0_buf", buf)
+
+    @property
+    def nu0(self) -> Optional[torch.Tensor]:
+        """torch.Tensor or None: Pivot frequency buffer (scalar, float64)."""
+        return getattr(self, "_nu0_buf", None)
+
+    def configure(
+        self,
+        *,
+        x: Optional[np.ndarray] = None,
+        nu0: Optional[float] = None,
+        hk: Optional[float] = None,
+        logT_lo: Optional[float] = None,
+        logT_hi: Optional[float] = None,
+        beta_lo: Optional[float] = None,
+        beta_hi: Optional[float] = None,
+        eps: Optional[float] = None,
+        **kwargs,
+    ) -> None:
+        """Configure the modified blackbody decoder after construction.
+
+        Parameters
+        ----------
+        x : array-like, optional
+            1-D frequency grid on which the spectrum is evaluated.
+        nu0 : float, optional
+            Pivot frequency for the ``(nu/nu0)**beta`` power-law factor.
+        hk : float, optional
+            ``h / k_B`` in units consistent with the x-grid.
+        logT_lo : float, optional
+            Lower bound of log10(T).
+        logT_hi : float, optional
+            Upper bound of log10(T).
+        beta_lo : float, optional
+            Lower bound of the emissivity index beta.
+        beta_hi : float, optional
+            Upper bound of the emissivity index beta.
+        eps : float, optional
+            Floor applied before ``log10``.
+        **kwargs
+            Additional keyword arguments are accepted and ignored.
+        """
+        if x is not None:
+            self._set_x(x)
+            self._init_nu0(nu0)
+        elif nu0 is not None:
+            self._init_nu0(nu0)
+        if hk is not None:
+            self.hk = float(hk)
+        if logT_lo is not None:
+            self.logT_lo = float(logT_lo)
+        if logT_hi is not None:
+            self.logT_hi = float(logT_hi)
+        if beta_lo is not None:
+            self.beta_lo = float(beta_lo)
+        if beta_hi is not None:
+            self.beta_hi = float(beta_hi)
+        if eps is not None:
+            self.eps = float(eps)
+
+    def normalize(self, y: np.ndarray, params: np.ndarray) -> dict:
+        """Compute normalisation statistics for the modified blackbody model.
+
+        Parameters
+        ----------
+        y : np.ndarray
+            Observed spectra (linear scale), shape ``(N, D)``.
+        params : np.ndarray
+            Physical input parameters, shape ``(N, P)``.
+
+        Returns
+        -------
+        dict
+            Nested dictionary with keys ``"params"``, ``"latent"``, and
+            ``"y"``.
+
+        Raises
+        ------
+        ValueError
+            If ``y`` or ``params`` are not 2-D, their leading dimensions
+            differ, or all amplitudes are non-finite.
+        """
+        y = np.asarray(y, np.float64)
+        params = np.asarray(params, np.float64)
+        _check_normalize_inputs(y, params)
+
+        if self.nu0 is None and hasattr(self, "_x") and self._x is not None:
+            self._init_nu0(None)
+
+        ylog = np.log10(np.clip(y, self.eps, None))
+        return {
+            "params": _normalize_params_stats(params),
+            "latent": _normalize_amplitude_latent(self.latent_dim, ylog),
+            "y": {"log": True, "eps": self.eps},
+        }
+
+    def latent_to_params(
+        self, z_phys: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Map raw latent codes to physical modified-blackbody parameters.
+
+        Parameters
+        ----------
+        z_phys : torch.Tensor
+            Raw latent tensor of shape ``(N, 3)`` with columns
+            ``[logA, logT_raw, beta_raw]``.
+
+        Returns
+        -------
+        logA : torch.Tensor
+            Log10-amplitude, shape ``(N,)``.
+        T : torch.Tensor
+            Dust temperature in linear scale, shape ``(N,)``.
+        beta : torch.Tensor
+            Emissivity spectral index in ``(beta_lo, beta_hi)``,
+            shape ``(N,)``.
+        """
+        z_phys = z_phys.to(torch.float64)
+        logA = z_phys[:, 0]
+        logT = sigmoid_asinh(z_phys[:, 1], self.logT_lo, self.logT_hi)
+        T = torch.pow(10.0, logT)
+        beta = sigmoid_asinh(z_phys[:, 2], self.beta_lo, self.beta_hi)
+        return logA, T, beta
+
+    def forward(self, z_phys: torch.Tensor) -> torch.Tensor:
+        """Evaluate the modified blackbody model and return ``log10(y)``.
+
+        The model evaluated is:
+
+          S(nu) ∝ A * (nu/nu0)^beta * nu^3 / (exp(hk*nu/T) - 1)
+
+        with the Planck exponential clamped to avoid overflow/underflow.
+
+        Parameters
+        ----------
+        z_phys : torch.Tensor
+            Raw latent tensor of shape ``(N, 3)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Log10-spectrum evaluated on the x-grid, shape ``(N, len(x))``.
+        """
+        logA, T, beta = self.latent_to_params(z_phys)
+
+        nu = torch.clamp(self.x[None, :], min=1e-300)          # (1, D)
+        nu0 = torch.clamp(self.nu0, min=1e-300)                 # scalar
+
+        # dimensionless frequency u = h*nu / (k_B * T)
+        u = (self.hk * nu) / T[:, None]                         # (N, D)
+        u = torch.clamp(u, min=1e-10, max=500.0)
+
+        # log10 of Planck-like factor: nu^3 / (exp(u) - 1)
+        log_planck = 3.0 * torch.log10(nu) - torch.log10(torch.expm1(u))
+
+        # log10 of power-law emissivity factor: (nu/nu0)^beta
+        log_pl = beta[:, None] * torch.log10(nu / nu0)
+
+        logy = logA[:, None] + log_pl + log_planck
+        return logy
+
+    def evaluate(self, z_phys: torch.Tensor) -> torch.Tensor:
+        """Evaluate the modified blackbody model and return linear-scale ``y``.
+
+        Parameters
+        ----------
+        z_phys : torch.Tensor
+            Raw latent tensor of shape ``(N, 3)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Linear-scale spectrum evaluated on the x-grid,
+            shape ``(N, len(x))``.
+        """
+        return torch.pow(10.0, self.forward(z_phys))
+
+    def get_config(self) -> dict:
+        """Return serialisable constructor arguments.
+
+        Returns
+        -------
+        dict
+            Dictionary with keys ``"nu0"``, ``"hk"``, ``"logT_lo"``,
+            ``"logT_hi"``, ``"beta_lo"``, ``"beta_hi"``, and ``"eps"``.
+        """
+        return dict(
+            nu0=None if self.nu0 is None else float(self.nu0.detach().cpu().item()),
+            hk=float(self.hk),
+            logT_lo=float(self.logT_lo),
+            logT_hi=float(self.logT_hi),
+            beta_lo=float(self.beta_lo),
+            beta_hi=float(self.beta_hi),
+            eps=float(self.eps),
+        )
