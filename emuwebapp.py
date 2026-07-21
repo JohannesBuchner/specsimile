@@ -130,6 +130,7 @@ class AppState:
     title: str = "SED Emulator"
     x_grid: np.ndarray = None   # stored x grid from the checkpoint
     y_range: tuple = None       # (y_min, y_max) for fixed axis range across plots
+    xnames: list = None         # output names from emulator (if available)
 
 
 STATE = AppState()
@@ -475,6 +476,20 @@ HTML_TEMPLATE = r"""
             margin-top: 16px; font-size: 0.78em; color: #4a5568;
             word-break: break-all; line-height: 1.5;
         }
+        .xnames-output {
+            margin-top: 18px; background: #0f3460; border-radius: 8px;
+            padding: 12px 14px; font-size: 0.82em; color: #90cdf4;
+            border: 1px solid #1a4a7a;
+        }
+        .xnames-output h3 { color: #63b3ed; margin-bottom: 8px; font-size: 0.95em; }
+        .xnames-output dl { margin: 0; }
+        .xnames-output dt {
+            color: #a0aec0; font-weight: bold; margin-top: 4px;
+        }
+        .xnames-output dd {
+            color: #e94560; font-weight: bold;
+            margin-left: 12px; margin-bottom: 2px;
+        }
     </style>
 </head>
 <body>
@@ -536,6 +551,18 @@ HTML_TEMPLATE = r"""
             </table>
         </div>
 
+        {% if xnames %}
+        <div class="xnames-output" id="xnames_display">
+            <h3>Output Values</h3>
+            <dl id="xnames_dl">
+                {% for name in xnames %}
+                <dt>{{ name }}</dt>
+                <dd id="xname_val_{{ loop.index0 }}">—</dd>
+                {% endfor %}
+            </dl>
+        </div>
+        {% endif %}
+
         <div class="model-info">
             Model: {{ model_path }}<br>
             Parameters: {{ sliders | length }}
@@ -568,6 +595,7 @@ const sliderDefs = {
     {% endfor %}
 };
 const paramNames = [{% for s in sliders %}"{{ s.name }}"{% if not loop.last %}, {% endif %}{% endfor %}];
+const xnames = [{% if xnames %}{% for name in xnames %}"{{ name }}"{% if not loop.last %}, {% endif %}{% endfor %}{% endif %}];
 
 let isComputing = false;
 let pendingUpdate = false;
@@ -625,6 +653,18 @@ function updatePhysValues() {
     }
 }
 
+function updateXnameValues(xname_values) {
+    if (!xnames || xnames.length === 0) return;
+    for (let i = 0; i < xnames.length; i++) {
+        const el = document.getElementById('xname_val_' + i);
+        if (el) {
+            const v = xname_values[i];
+            el.textContent = (v !== null && v !== undefined && isFinite(v))
+                ? fmtVal(v) : '—';
+        }
+    }
+}
+
 function resetDefaults() {
     for (const name of paramNames) {
         document.getElementById('slider_' + name).value = defaults[name];
@@ -671,6 +711,9 @@ function runEmulator() {
                 '  Max y: ' + data.max_y + ' ' + data.yunit,
                 'success'
             );
+            if (data.xname_values) {
+                updateXnameValues(data.xname_values);
+            }
         }
         if (pendingUpdate) { pendingUpdate = false; scheduleAutoUpdate(); }
     })
@@ -700,6 +743,7 @@ def index():
         title=STATE.title,
         model_path=STATE.model_path,
         sliders=STATE.sliders,
+        xnames=STATE.xnames,
     )
 
 
@@ -723,6 +767,17 @@ def compute():
             peak_x = f"{round(x[idx], 2)}"
             max_y = f"{y[idx]:.2e}"
 
+        # Build xname_values if xnames are available
+        xname_values = None
+        if STATE.xnames is not None and not error_msg:
+            emu = STATE.emulator
+            try:
+                d = emu.to_dict(y)
+                xname_values = [float(d[name]) if np.isfinite(d[name]) else None
+                                for name in STATE.xnames]
+            except Exception:
+                xname_values = None
+
         return jsonify(
             dict(
                 img=img_b64,
@@ -731,6 +786,7 @@ def compute():
                 max_y=max_y,
                 xunit=STATE.xunit,
                 yunit=STATE.yunit,
+                xname_values=xname_values,
             )
         )
     except Exception as e:
@@ -739,7 +795,8 @@ def compute():
         return jsonify(
             dict(img="", error=str(e) + "\n" + tb,
                  peak_x="N/A", max_y="N/A",
-                 xunit="", yunit="")
+                 xunit="", yunit="",
+                 xname_values=None)
         )
 
 
@@ -768,6 +825,7 @@ def main():
     STATE.xunit  = meta.get("xunit")  or ""
     STATE.ylabel = meta.get("ylabel") or "y"
     STATE.yunit  = meta.get("yunit")  or ""
+    STATE.xnames = emu.xnames  # may be None if not available
 
     # Derive a human-readable title from the model file name
     stem = os.path.splitext(os.path.basename(args.model_path))[0]
@@ -779,6 +837,8 @@ def main():
     STATE.x_grid = _infer_x_grid(emu)
     print(f"x grid: {len(STATE.x_grid)} points  [{STATE.x_grid.min():.4g} .. {STATE.x_grid.max():.4g}] {STATE.xunit}")
     print(f"Parameters ({len(STATE.paramnames)}): {STATE.paramnames}")
+    if STATE.xnames is not None:
+        print(f"Output names (xnames, {len(STATE.xnames)}): {STATE.xnames}")
 
     # Pre-compute y range for consistent axis limits across all plots
     print("Computing y-axis range from emulator samples (for consistent plot scaling)...")
