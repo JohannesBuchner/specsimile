@@ -2,7 +2,7 @@ import os
 import tempfile
 import numpy as np
 import pytest
-from hypothesis import given, settings
+from hypothesis import given, settings, assume
 from hypothesis import strategies as st
 from hypothesis.extra.numpy import arrays
 
@@ -66,6 +66,11 @@ def test_as_bytes_array_empty():
 
 @given(st.lists(st.text(alphabet=st.characters(blacklist_categories=("Cs",)), max_size=20), max_size=10))
 def test_as_bytes_array_roundtrip(strings):
+    for s in strings:
+        try:
+            s.encode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            assume(False)
     result = _as_bytes_array(strings)
     for original, encoded in zip(strings, result):
         assert encoded == original.encode("utf-8")

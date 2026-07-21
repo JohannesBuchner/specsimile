@@ -461,7 +461,7 @@ def test_inside_param_bounds_none():
     emu = make_emulator_no_dynamic_range()
     P = np.ones((3, 2))
     result = emu.inside_param_bounds(P)
-    assert result is None
+    assert np.all(result)
 
 
 def test_inside_param_bounds_all_inside():

@@ -6,10 +6,7 @@ import h5py
 import numpy as np
 from typing import Optional, Union, List
 
-try:
-    import astropy.units as u
-except Exception:  # astropy optional
-    u = None
+import astropy.units as u
 
 
 def _unit_to_string(unit: Optional[Union[str, "u.UnitBase", "u.Quantity"]]) -> str:
@@ -411,6 +408,7 @@ class DatasetReader:
     def __str__(self) -> str:
         return (
             f"Dataset(filename={self.filename},\n"
+            f"    paramnames={self.paramnames},\n"
             f"    xlabel={self.xlabel}, xunit={self.xunit}, x={self.x.min()}..{self.x.max()},\n"
             f"    ylabel={self.ylabel}, yunit={self.yunit}, y={self.y.min()}..{self.y.max()},\n"
             f"    xnames={self.xnames},\n"
