@@ -569,7 +569,7 @@ def load_decoder_bundle(path: str, prefix: str = '', verbose: bool = False) -> d
             str(tuple(bundle[f'{p}W{j}'].shape))
             for j in range(bundle[f'{p}n_layers'])
         )
-        print(f"  {prefix}: {bundle[f'{p}n_layers']} layers: {shapes}")
+        print(f"  {prefix} {bundle[f'{p}n_layers']} layers: {shapes}")
 
     # --- Normalisation ------------------------------------------------------
     if '_norm' in emu_weights:

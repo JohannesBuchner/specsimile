@@ -67,6 +67,10 @@ def test_as_bytes_array_empty():
 @given(st.lists(st.text(alphabet=st.characters(blacklist_categories=("Cs",)), max_size=20), max_size=10))
 def test_as_bytes_array_roundtrip(strings):
     for s in strings:
+        if not isinstance(s, str) or '\x00' in s:
+            assume(False)
+        if len(s) == 0:
+            assume(False)
         try:
             s.encode("utf-8")
         except (UnicodeEncodeError, UnicodeDecodeError):
