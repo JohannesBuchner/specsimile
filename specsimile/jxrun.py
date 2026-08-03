@@ -216,7 +216,7 @@ def jax_cutoffpl_latent_to_params(
     -------
     jnp.ndarray
         Physical parameter array of shape (N, 3) with columns
-        [logA, gamma, xcut].
+        [log108A, gamma, xcut].
     """
     logA = z_phys[:, 0]
     gamma = _jax_sigmoid_asinh(z_phys[:, 1], gamma_lo, gamma_hi)
@@ -254,7 +254,7 @@ def _jax_cutoffpl_latent_to_params_warm(
     -------
     jnp.ndarray
         Physical parameter array of shape (N, 3) with columns
-        [logA, gamma, xcut].
+        [log10A, gamma, xcut].
     """
     logA = z_phys[:, 0]
     gamma = _jax_sigmoid_asinh(z_phys[:, 1], gamma_lo, gamma_hi)
@@ -294,14 +294,7 @@ def _jax_sbpl_latent_to_params(
     -------
     jnp.ndarray
         Physical parameter array of shape (N, 5) with columns
-        [lognorm, uvslope, plslope, plbendloc, plbendwidth].
-
-    Notes
-    -----
-    duallike.py names these as:
-      lognorm_510, uvslope, plslope, plbendloc, plbendwidth = dec5.transpose()
-    where dec5 comes from emu.predict_sbpl_params which calls
-    transform(..., return_latent_params=True) -> latent_to_params.
+        [log10norm, uvslope, plslope, plbendloc, plbendwidth].
     """
     lognorm = z_phys[:, 0]
     s1 = slope_scale * jnp.arcsinh(z_phys[:, 1])
@@ -341,13 +334,7 @@ def _jax_quadratic_latent_to_params(
     -------
     jnp.ndarray
         Physical parameter array of shape (N, 3) with columns
-        [logA, xpeak, w].
-
-    Notes
-    -----
-    emuloader.py then converts:
-      out[:, 0] *= ln10    (logA -> lnA)
-      out[:, 2] /= sqrt(ln10)  (sigma log10 -> sigma ln)
+        [log10A, xpeak, width].
     """
     logA = z_phys[:, 0]
     logxpeak = _jax_sigmoid_asinh(z_phys[:, 1], logx_lo, logx_hi)
