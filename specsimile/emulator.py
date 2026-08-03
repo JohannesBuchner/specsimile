@@ -524,6 +524,11 @@ class Emulator:
         # set during fit() once the parameter ranges are known
         self._smooth_step: torch.Tensor | None = None
 
+        # These are set after fit() or load() and used by save_latex_table()
+        self._nin: int | None = None
+        self._nout: int | None = None
+        self._ydim: int | None = None
+
         if loss_y_weights is None:
             self.loss_y_weights = 1.0
         else:
@@ -742,259 +747,6 @@ class Emulator:
             delta_norm.reshape(1, -1), dtype=torch.float64, device=self.device
         )
 
-    def _taylor_consistency_penalty(
-        self,
-        xb: torch.Tensor,
-        enc: nn.Module,
-        dec: nn.Module,
-        lat_mean: torch.Tensor | float,
-        lat_std: torch.Tensor | float,
-        y_mean: torch.Tensor,
-        y_std: torch.Tensor,
-        direction: torch.Tensor,
-        *,
-        create_graph: bool = True,
-    ) -> torch.Tensor:
-        """Penalise gradients inconsistent with nearby function values.
-
-            residual = f(x + delta) - f(x) - delta · grad_f(x)
-
-        Parameters
-        ----------
-        xb : torch.Tensor
-            Batch of normalised input parameters, shape ``(B, n_input)``.
-        enc : nn.Module
-            Encoder network mapping normalised params to normalised latents.
-        dec : nn.Module
-            Decoder network mapping physical latents to output spectra.
-        lat_mean : torch.Tensor or float
-            Latent mean used to de-normalise encoder outputs.
-        lat_std : torch.Tensor or float
-            Latent std used to de-normalise encoder outputs.
-        y_mean : torch.Tensor
-            Output mean for standardisation, shape ``(1, y_dim)``.
-        y_std : torch.Tensor
-            Output std for standardisation, shape ``(1, y_dim)``.
-        direction : torch.Tensor
-            Unit-vector perturbation directions in inference-param space,
-            shape ``(B, n_inf)``.
-        create_graph : bool, optional
-            ``True`` during training (penalty must be differentiable w.r.t.
-            weights). ``False`` during validation (only need the scalar
-            value). Default is ``True``.
-
-        Returns
-        -------
-        torch.Tensor
-            Scalar smoothness penalty value.
-        """
-        B = xb.shape[0]
-        n_ctx = self.n_context_params
-
-        assert self._smooth_step is not None
-        # _smooth_step: (1, n_inf), already in normalised-input units,
-        # scaled by the physical parameter range fraction smooth_frac.
-        delta_inf = direction * self._smooth_step          # (B, n_inf)
-
-        # Pad context dimensions with zero (context does not move)
-        if n_ctx > 0:
-            delta_full = torch.cat([
-                delta_inf,
-                xb.new_zeros(B, n_ctx),
-            ], dim=1)
-        else:
-            delta_full = delta_inf
-
-        def forward_standardized(x_in: torch.Tensor) -> torch.Tensor:
-            z_norm = torch.clamp(enc(x_in), -25, 25)
-            z_phys = z_norm * lat_std + lat_mean
-            y_pre  = dec(z_phys)
-            return (y_pre - y_mean) / y_std
-
-        # --- f(x + delta): detached, no gradient needed ---
-        with torch.no_grad():
-            fx_perturbed = forward_standardized(xb + delta_full)   # (B, Y)
-
-        # --- f(x): keep in graph so encoder weights get gradients ---
-        # Do NOT detach xb. The gradient of the penalty w.r.t. encoder
-        # weights flows through fx -> enc(xb) -> encoder parameters.
-        xb_req = xb.requires_grad_(True)  # in-place, no detach
-        fx = forward_standardized(xb_req)
-
-        # --- grad_f(x) w.r.t. xb: needs create_graph=True so that
-        #     the gradient of (residual^2) w.r.t. encoder weights
-        #     can be computed via the chain:
-        #     residual -> linear_prediction -> grad_fx -> fx -> enc weights
-        # ---
-        grad_fx = torch.autograd.grad(
-            outputs=fx.sum(),
-            inputs=xb_req,
-            create_graph=create_graph,
-            retain_graph=True,         # fx is used again below for residual
-        )[0]                                                       # (B, n_input)
-
-        # --- Taylor residual ---
-        linear_prediction = (grad_fx * delta_full).sum(dim=1, keepdim=True)  # (B, 1)
-
-        # fx_perturbed is detached (computed under no_grad).
-        # fx is in the graph — this is what lets the penalty train the encoder.
-        residual = (fx_perturbed - fx) - linear_prediction                    # (B, Y)
-
-        return (residual ** 2).mean()
-
-    def _gradient_magnitude_penalty(
-        self,
-        xb: torch.Tensor,
-        enc: nn.Module,
-        dec: nn.Module,
-        lat_mean: torch.Tensor | float,
-        lat_std: torch.Tensor | float,
-        y_mean: torch.Tensor,
-        y_std: torch.Tensor,
-        *,
-        create_graph: bool = True,
-    ) -> torch.Tensor:
-        """Penalise large input-gradients at training points.
-
-        Computes ``d f(x) / d x_inf`` (inference dims only) and penalises
-        its squared magnitude. This directly discourages spikes in the
-        learned function at training locations.
-
-        For a piecewise-linear network (LeakyReLU), this penalises the
-        slope of each active linear piece, pushing the network toward
-        shallower, wider pieces — exactly what reduces gradient noise
-        seen by HMC.
-
-        Parameters
-        ----------
-        xb : torch.Tensor
-            Batch of normalised input parameters, shape ``(B, n_input)``.
-        enc : nn.Module
-            Encoder network.
-        dec : nn.Module
-            Decoder network.
-        lat_mean : torch.Tensor or float
-            Latent mean for de-normalisation.
-        lat_std : torch.Tensor or float
-            Latent std for de-normalisation.
-        y_mean : torch.Tensor
-            Output mean for standardisation, shape ``(1, y_dim)``.
-        y_std : torch.Tensor
-            Output std for standardisation, shape ``(1, y_dim)``.
-        create_graph : bool, optional
-            Whether to build a differentiable graph through the gradient
-            computation. Default is ``True``.
-
-        Returns
-        -------
-        torch.Tensor
-            Scalar gradient-magnitude penalty.
-        """
-        B = xb.shape[0]
-        n_ctx = self.n_context_params
-        n_inf = xb.shape[1] - n_ctx
-
-        def forward_standardized(x_in: torch.Tensor) -> torch.Tensor:
-            z_norm = torch.clamp(enc(x_in), -25, 25)
-            z_phys = z_norm * lat_std + lat_mean
-            y_pre  = dec(z_phys)
-            return (y_pre - y_mean) / y_std        # (B, Y)
-
-        xb_req = xb.detach().requires_grad_(True)
-        fx = forward_standardized(xb_req)          # (B, Y)
-
-        # Sum over outputs and batch to get a scalar, then differentiate.
-        # create_graph=True so that loss.backward() can propagate through
-        # grad_fx back to the encoder weights.
-        grad_fx = torch.autograd.grad(
-            outputs=fx.sum(),
-            inputs=xb_req,
-            create_graph=create_graph,
-        )[0]                                       # (B, n_input)
-
-        # Penalise only inference dims (context is fixed during HMC anyway)
-        grad_inf = grad_fx[:, :n_inf]              # (B, n_inf)
-
-        return (grad_inf ** 2).mean()
-
-    def _gradient_penalty(
-        self,
-        xb: torch.Tensor,
-        enc: nn.Module,
-        dec: nn.Module,
-        lat_mean: torch.Tensor | float,
-        lat_std: torch.Tensor | float,
-        y_mean: torch.Tensor,
-        y_std: torch.Tensor,
-    ) -> torch.Tensor:
-        """Compute a random-directional gradient penalty via JVP.
-
-        Parameters
-        ----------
-        xb : torch.Tensor
-            Batch of normalised input parameters, shape ``(B, n_input)``.
-        enc : nn.Module
-            Encoder network.
-        dec : nn.Module
-            Decoder network.
-        lat_mean : torch.Tensor or float
-            Latent mean for de-normalisation.
-        lat_std : torch.Tensor or float
-            Latent std for de-normalisation.
-        y_mean : torch.Tensor
-            Output mean for standardisation, shape ``(1, y_dim)``.
-        y_std : torch.Tensor
-            Output std for standardisation, shape ``(1, y_dim)``.
-
-        Returns
-        -------
-        torch.Tensor
-            Scalar penalty (zero when ``smooth_weight == 0``).
-        """
-        if self.smooth_weight == 0.0:
-            return xb.new_tensor(0.0)
-
-        n_ctx = self.n_context_params
-        B = xb.shape[0]
-        n_inf = xb.shape[1] - n_ctx if n_ctx > 0 else xb.shape[1]
-
-        x_inf = xb[:, :-n_ctx] if n_ctx > 0 else xb
-        x_ctx = xb[:, -n_ctx:] if n_ctx > 0 else None
-
-        # Random unit direction in inference-param space, one per sample
-        v = torch.randn(B, n_inf, dtype=xb.dtype, device=xb.device)
-        v = v / (v.norm(dim=1, keepdim=True) + 1e-30)   # (B, n_inf)
-
-        def forward_fn(x_inf_single: torch.Tensor, x_ctx_single: torch.Tensor | None) -> torch.Tensor:
-            if n_ctx > 0:
-                x_full = torch.cat([
-                    x_inf_single.unsqueeze(0),
-                    x_ctx_single.unsqueeze(0)
-                ], dim=1)
-            else:
-                x_full = x_inf_single.unsqueeze(0)
-            z_norm = torch.clamp(enc(x_full), -25, 25)
-            z_phys = z_norm * lat_std + lat_mean
-            y_pre = dec(z_phys).squeeze(0)
-            return (y_pre - y_mean.squeeze(0)) / y_std.squeeze(0)  # standardized
-
-        if n_ctx > 0:
-            jvp_fn = torch.func.vmap(
-                lambda xi, xc, vi: torch.func.jvp(
-                    lambda t: forward_fn(t, xc), (xi,), (vi,)
-                )[1]  # take only the tangent, not the primal
-            )
-            directional_deriv = jvp_fn(x_inf, x_ctx, v)  # (B, Y)
-        else:
-            jvp_fn = torch.func.vmap(
-                lambda xi, vi: torch.func.jvp(
-                    forward_fn, (xi,), (vi,)
-                )[1]
-            )
-            directional_deriv = jvp_fn(x_inf, v)
-
-        return (directional_deriv ** 2).mean()
-
     # ---------- checkpoint IO ----------
 
     def load(self, verbose: bool = True) -> bool:
@@ -1077,6 +829,17 @@ class Emulator:
         self._encoder.load_state_dict(ckpt["encoder_state"])
         self._encoder.to(self.device).double().eval()
         self._loaded = True
+
+        # Store architecture dimensions for save_latex_table()
+        self._nin = nin
+        self._nout = nout
+        # Infer ydim from the x_grid stored in meta, if available
+        x_grid = self._meta.get("x_grid", None)
+        if x_grid is not None:
+            self._ydim = len(x_grid)
+        else:
+            self._ydim = None
+
         if verbose:
             print("Loaded:", self._encoder)
         return self._loaded
@@ -1161,30 +924,39 @@ class Emulator:
             f"-{dec_name}-[y:{ydim}]"
         )
 
-    def _save_latex_table(
-        self,
-        nin: int,
-        nout: int,
-        ydim: int,
-    ) -> None:
+    def save_latex_table(self) -> None:
         """Write a LaTeX table describing the architecture next to the model file.
 
         The table file is placed alongside ``self.model_path`` with the
         same stem and a ``.tex`` extension.
 
-        Parameters
-        ----------
-        nin : int
-            Total number of input parameters (inference + context).
-        nout : int
-            Latent dimension (encoder output).
-        ydim : int
-            Number of output (spectrum) bins.
+        This method infers ``nin``, ``nout`` (latent dim), and ``ydim``
+        from attributes stored during :meth:`fit` or :meth:`load`.
 
         Returns
         -------
         None
+
+        Raises
+        ------
+        RuntimeError
+            If the emulator has not been fitted or loaded yet (i.e. the
+            required architecture attributes are not available).
         """
+        if self._nin is None or self._nout is None:
+            raise RuntimeError(
+                "save_latex_table() requires the emulator to be fitted or "
+                "loaded first (nin/nout not available)."
+            )
+        if self._ydim is None:
+            raise RuntimeError(
+                "save_latex_table() requires the emulator to be fitted or "
+                "loaded first (ydim not available)."
+            )
+
+        nin = self._nin
+        nout = self._nout
+        ydim = self._ydim
         latent_dim = nout
         decoder_class = self.decoder.__class__.__name__
         tex = _build_latex_table(
@@ -1756,6 +1528,11 @@ class Emulator:
         self._meta = meta
         self._loaded = True
         self.paramnames = dataset.paramnames
+
+        # Store architecture dimensions for save_latex_table()
+        self._nin = nin
+        self._nout = nout
+        self._ydim = int(Y.shape[1])
 
         return self.model_path
 
