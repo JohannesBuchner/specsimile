@@ -188,7 +188,7 @@ def _jax_sigmoid_asinh(x: jnp.ndarray, lo: float, hi: float) -> jnp.ndarray:
     return mid + (spread / 4.0) * jnp.arcsinh(x)
 
 
-def _jax_cutoffpl_latent_to_params(
+def jax_cutoffpl_latent_to_params(
     z_phys: jnp.ndarray,
     gamma_lo: float = 0.5,
     gamma_hi: float = 6.0,

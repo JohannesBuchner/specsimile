@@ -205,7 +205,7 @@ def test_cutoffpl_emulator_vs_jxrun():
         logxcut_hi = float(np.log10(xcut_hi_val))
 
         # latent_to_params
-        params_jax = jxrun._jax_cutoffpl_latent_to_params(
+        params_jax = jxrun.jax_cutoffpl_latent_to_params(
             z_phys_jax,
             gamma_lo=gamma_lo,
             gamma_hi=gamma_hi,
