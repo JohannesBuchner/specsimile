@@ -237,7 +237,8 @@ class DatasetWriter:
 
         self.num_data_training += 1
         self._f.attrs["num_data_training"] = int(self.num_data_training)
-        self._f.flush()
+        if i == 1 or i == 10 or i == 100 or i == 1000 or i == 10000 or i == 100000 or i % 10_000_000 == 0:
+            self._f.flush()
 
         # auto-close when full (keeps old behavior)
         if self.num_data_training == self._f["y"].shape[0]:
