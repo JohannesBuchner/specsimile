@@ -487,6 +487,11 @@ def load_decoder_bundle(path: str, prefix: str = '', verbose: bool = False) -> d
     if ynames is not None:
         bundle[f'{p}ynames'] = list(ynames)
 
+    # Store training parameter bounds if available
+    train_param_bounds = meta.get('train_param_bounds', None)
+    if train_param_bounds is not None:
+        bundle[f'{p}train_param_bounds'] = train_param_bounds
+
     if has_conditional:
         # --- Main network layers (main_net.0.weight, main_net.0.bias, …) ---
         main_w_keys = sorted(
@@ -621,6 +626,145 @@ def load_decoder_bundle(path: str, prefix: str = '', verbose: bool = False) -> d
 
     return bundle
 
+
+def verify_bundle_param_bounds(
+    bundle: dict,
+    prefix: str,
+    params: np.ndarray,
+    param_bounds_tol: float = 0.0,
+    param_bounds_policy: str = 'error',
+) -> np.ndarray:
+    """
+    Verify whether input parameters are within the training sample range.
+
+    Checks each row of *params* against the per-parameter min/max bounds
+    stored in the bundle under ``{prefix}_train_param_bounds``.  The
+    behaviour when out-of-bounds rows are found is controlled by
+    *param_bounds_policy*, mirroring the ``param_bounds_policy`` /
+    ``param_bounds_tol`` attributes of ``Emulator``.
+
+    Parameters
+    ----------
+    bundle : dict
+        Parameter bundle as returned by :func:`load_decoder_bundle`.  Must
+        contain ``{prefix_}train_param_bounds`` (a dict with keys ``'min'``
+        and ``'max'``) for bounds checking to be performed.  If the key is
+        absent the function returns an all-True mask without raising.
+    prefix : str
+        Key prefix under which the emulator was stored, e.g. ``'hot'``.
+    params : np.ndarray
+        Parameter array of shape ``(N, n_params)`` or ``(n_params,)`` for a
+        single sample (automatically promoted to 2-D).
+    param_bounds_tol : float, optional
+        Tolerance added symmetrically to each bound.  A parameter value
+        ``v`` is considered in-bounds when
+        ``pmin - tol <= v <= pmax + tol``.  Negative values disable bounds
+        checking entirely (all rows are treated as in-bounds).
+        Default is ``0.0``.
+    param_bounds_policy : str, optional
+        What to do when out-of-bounds rows are detected.
+
+        ``'error'``
+            Raise a ``ValueError`` with a descriptive message identifying
+            the first offending row and the violated bounds.
+        ``'warn'``
+            Emit a :mod:`warnings` warning and return the boolean mask.
+        ``'nan'``
+            Return the boolean mask silently (the caller is responsible for
+            replacing out-of-bounds outputs with NaN).
+        ``'ignore'``
+            Return the boolean mask silently without any warning or error.
+
+        Default is ``'error'``.
+
+    Returns
+    -------
+    inside : np.ndarray
+        Boolean array of shape ``(N,)``.  ``True`` for every row whose
+        parameters all lie within ``[pmin - tol, pmax + tol]``.
+
+    Raises
+    ------
+    ValueError
+        If *param_bounds_policy* is ``'error'`` and any row is out of bounds.
+    ValueError
+        If the number of columns in *params* does not match the stored
+        bounds dimensionality.
+    """
+    import warnings
+
+    p = f'{prefix}_' if prefix else ''
+    bounds_key = f'{p}train_param_bounds'
+
+    params = np.asarray(params, dtype=np.float64)
+    squeeze = params.ndim == 1
+    if squeeze:
+        params = params[None, :]
+
+    N, n_params = params.shape
+
+    # If no bounds are stored or tolerance is negative, treat everything as in-bounds
+    if bounds_key not in bundle or param_bounds_tol < 0:
+        return np.ones(N, dtype=bool)
+
+    bounds = bundle[bounds_key]
+    pmin = np.asarray(bounds['min'], dtype=np.float64).reshape(-1)
+    pmax = np.asarray(bounds['max'], dtype=np.float64).reshape(-1)
+
+    if n_params != len(pmin):
+        raise ValueError(
+            f"params has {n_params} columns but stored bounds have "
+            f"{len(pmin)} dimensions."
+        )
+
+    inside = np.all(
+        (params >= pmin[None, :] - param_bounds_tol) &
+        (params <= pmax[None, :] + param_bounds_tol),
+        axis=1,
+    )
+
+    if np.all(inside):
+        return inside
+
+    # There are out-of-bounds rows — act according to policy
+    if param_bounds_policy == 'ignore' or param_bounds_policy == 'nan':
+        return inside
+
+    # Build a descriptive message for the first offending row
+    first_bad = int(np.where(~inside)[0][0])
+    row = params[first_bad]
+    violated_parts = []
+    paramnames = bundle.get(f'{p}paramnames', None)
+    for j, (lo, hi, val) in enumerate(zip(pmin, pmax, row)):
+        if not (lo - param_bounds_tol <= val <= hi + param_bounds_tol):
+            name = paramnames[j] if paramnames is not None else f"param[{j}]"
+            violated_parts.append(
+                f"  {name}={val} outside [{lo}, {hi}] "
+                f"(tol={param_bounds_tol})"
+            )
+    n_bad = int(np.sum(~inside))
+    msg = (
+        f"{n_bad}/{N} parameter row(s) are outside the training bounds "
+        f"(first offending row {first_bad}):\n"
+        + "\n".join(violated_parts)
+        + f"\n  params={row}"
+        + f"\n  pmin={pmin}"
+        + f"\n  pmax={pmax}"
+    )
+
+    if param_bounds_policy == 'error':
+        raise ValueError(msg)
+    elif param_bounds_policy == 'warn':
+        warnings.warn(msg, stacklevel=2)
+        return inside
+    else:
+        # Unrecognised policy — fall back to warning
+        warnings.warn(
+            f"Unknown param_bounds_policy={param_bounds_policy!r}; "
+            f"treating as 'warn'.\n" + msg,
+            stacklevel=2,
+        )
+        return inside
 
 
 def get_bundle_paramnames(bundle: dict, prefix: str) -> List[str]:

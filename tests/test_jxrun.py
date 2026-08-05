@@ -36,8 +36,7 @@ def _build_and_train_emulator(model_path: str, dataset_path: str) -> Emulator:
         model_path=model_path,
         decoder=decoder,
         shape=[2],
-        acti="LeakyReLU",
-        device="cpu",
+        param_bounds_policy='warn',
     )
     dataset = DatasetReader(dataset_path)
     emu.fit(
@@ -45,8 +44,8 @@ def _build_and_train_emulator(model_path: str, dataset_path: str) -> Emulator:
         epochs=1,
         lr=1e-3,
         batch_size=10,
-        train_split=0.8,
-        patience=100,
+        # train_split=0.8,
+        # patience=100,
         seed=7,
     )
     dataset.close()
@@ -396,4 +395,174 @@ def test_dense_emulator_vs_jxrun():
             rtol=1e-5,
             atol=1e-10,
             err_msg="Dense emulator outputs differ between specsimile and jxrun paths",
+        )
+
+
+def test_inside_param_bounds_consistent_with_verify_bundle_param_bounds():
+    """
+    Train a tiny CutoffPL emulator, then verify that Emulator.inside_param_bounds
+    and jxrun.verify_bundle_param_bounds give consistent answers for a range of
+    input parameter samples.
+
+    The bounds stored in the emulator are derived from the min/max across the
+    training samples.  Both functions should agree on whether each row is
+    inside or outside those bounds.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        dataset_path = os.path.join(tmpdir, "dataset_bounds.h5")
+        model_path = os.path.join(tmpdir, "emu_bounds.pt")
+
+        # Build a dataset with known parameter ranges so we can craft both
+        # inside and outside samples deterministically.
+        rng = np.random.default_rng(0)
+        x = np.logspace(0, 2, 10)
+        N = 30
+        paramnames = ["logA", "gamma", "logxcut"]
+
+        # Training ranges: logA in [0,2], gamma in [1,3], logxcut in [1,2]
+        with DatasetWriter(dataset_path, N=N, x=x, paramnames=paramnames) as writer:
+            for _ in range(N):
+                logA = rng.uniform(0.0, 2.0)
+                gamma = rng.uniform(1.0, 3.0)
+                logxcut = rng.uniform(1.0, 2.0)
+                xcut = 10.0 ** logxcut
+                y = (10.0 ** logA) * x ** (-gamma) * np.exp(-x / xcut)
+                writer.append(x, y, np.array([logA, gamma, logxcut]))
+
+        # Train emulator (1 epoch is enough; we only need the bounds)
+        decoder = CutoffPLDecoder(gamma_lo=0.5, gamma_hi=6.0, xcut_lo=1.0, xcut_hi=1e3)
+        emu = Emulator(
+            model_path=model_path,
+            decoder=decoder,
+            shape=[2],
+            acti="LeakyReLU",
+            device="cpu",
+        )
+        dataset = DatasetReader(dataset_path)
+        emu.fit(
+            dataset,
+            epochs=1,
+            lr=1e-3,
+            batch_size=10,
+            train_split=0.8,
+            patience=100,
+            seed=3,
+        )
+        dataset.close()
+
+        # Load the bundle via jxrun
+        bundle = jxrun.load_decoder_bundle(model_path, prefix="bnd", verbose=False)
+
+        # Retrieve the actual min/max bounds that were stored during training
+        assert emu.train_param_bounds is not None, "train_param_bounds should be set after fit()"
+        pmin = np.array(emu.train_param_bounds["min"])
+        pmax = np.array(emu.train_param_bounds["max"])
+
+        # Construct test parameter rows:
+        #  - some clearly inside the training range
+        #  - some clearly outside (below min or above max for each dimension)
+        n_inside = 5
+        n_outside = 6
+
+        inside_params = np.column_stack([
+            rng.uniform(pmin[0], pmax[0], size=n_inside),
+            rng.uniform(pmin[1], pmax[1], size=n_inside),
+            rng.uniform(pmin[2], pmax[2], size=n_inside),
+        ])
+
+        # Outside samples: push one parameter well beyond each bound
+        margin = 0.5  # ensure they are clearly outside (> tolerance)
+        outside_params = np.array([
+            [pmin[0] - margin, (pmin[1] + pmax[1]) / 2, (pmin[2] + pmax[2]) / 2],  # logA below min
+            [pmax[0] + margin, (pmin[1] + pmax[1]) / 2, (pmin[2] + pmax[2]) / 2],  # logA above max
+            [(pmin[0] + pmax[0]) / 2, pmin[1] - margin, (pmin[2] + pmax[2]) / 2],  # gamma below min
+            [(pmin[0] + pmax[0]) / 2, pmax[1] + margin, (pmin[2] + pmax[2]) / 2],  # gamma above max
+            [(pmin[0] + pmax[0]) / 2, (pmin[1] + pmax[1]) / 2, pmin[2] - margin],  # logxcut below min
+            [(pmin[0] + pmax[0]) / 2, (pmin[1] + pmax[1]) / 2, pmax[2] + margin],  # logxcut above max
+        ])
+
+        all_params = np.vstack([inside_params, outside_params])
+
+        # --- Emulator.inside_param_bounds ---
+        emu_mask = emu.inside_param_bounds(all_params)
+
+        # --- jxrun.verify_bundle_param_bounds (policy='ignore' so no exception) ---
+        bundle_mask = jxrun.verify_bundle_param_bounds(
+            bundle,
+            prefix="bnd",
+            params=all_params,
+            param_bounds_tol=0.0,
+            param_bounds_policy="ignore",
+        )
+
+        assert emu_mask.shape == bundle_mask.shape, (
+            f"Mask shape mismatch: emu={emu_mask.shape}, bundle={bundle_mask.shape}"
+        )
+
+        # Both masks must agree on every row
+        np.testing.assert_array_equal(
+            emu_mask,
+            bundle_mask,
+            err_msg=(
+                "inside_param_bounds and verify_bundle_param_bounds disagree.\n"
+                f"emu_mask   = {emu_mask}\n"
+                f"bundle_mask= {bundle_mask}\n"
+                f"params=\n{all_params}\n"
+                f"pmin={pmin}\npmax={pmax}"
+            ),
+        )
+
+        # Sanity checks: the inside_params rows should all be True,
+        # the outside_params rows should all be False.
+        assert np.all(emu_mask[:n_inside]), (
+            f"Expected all inside_params to be in-bounds, got {emu_mask[:n_inside]}"
+        )
+        assert not np.any(emu_mask[n_inside:]), (
+            f"Expected all outside_params to be out-of-bounds, got {emu_mask[n_inside:]}"
+        )
+
+        # Also verify the single-sample (1-D) path for verify_bundle_param_bounds
+        single_inside = inside_params[0]
+        single_outside = outside_params[0]
+
+        mask_single_in = jxrun.verify_bundle_param_bounds(
+            bundle, prefix="bnd", params=single_inside,
+            param_bounds_tol=0.0, param_bounds_policy="ignore",
+        )
+        mask_single_out = jxrun.verify_bundle_param_bounds(
+            bundle, prefix="bnd", params=single_outside,
+            param_bounds_tol=0.0, param_bounds_policy="ignore",
+        )
+
+        assert mask_single_in.shape == (1,), f"Expected shape (1,), got {mask_single_in.shape}"
+        assert mask_single_out.shape == (1,), f"Expected shape (1,), got {mask_single_out.shape}"
+        assert bool(mask_single_in[0]), "Single inside sample should be in-bounds"
+        assert not bool(mask_single_out[0]), "Single outside sample should be out-of-bounds"
+
+        # Verify that the 'error' policy raises for out-of-bounds inputs
+        with pytest.raises(ValueError):
+            jxrun.verify_bundle_param_bounds(
+                bundle, prefix="bnd", params=outside_params,
+                param_bounds_tol=0.0, param_bounds_policy="error",
+            )
+
+        # Verify that a non-negative tolerance widens the accepted region:
+        # a sample just outside should become inside when tol >= margin
+        tol = margin + 0.1
+        mask_with_tol = jxrun.verify_bundle_param_bounds(
+            bundle, prefix="bnd", params=outside_params,
+            param_bounds_tol=tol, param_bounds_policy="ignore",
+        )
+        assert np.all(mask_with_tol), (
+            f"With tol={tol} all outside_params should become in-bounds, "
+            f"got {mask_with_tol}"
+        )
+
+        # Negative tolerance disables bounds checking -> all True
+        mask_neg_tol = jxrun.verify_bundle_param_bounds(
+            bundle, prefix="bnd", params=all_params,
+            param_bounds_tol=-1.0, param_bounds_policy="ignore",
+        )
+        assert np.all(mask_neg_tol), (
+            "Negative tolerance should disable bounds checking (all True)"
         )

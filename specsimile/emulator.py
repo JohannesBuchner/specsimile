@@ -1491,6 +1491,8 @@ class Emulator:
         self.fit_median = float(np.percentile(err, 50))
         self.fit_p95 = float(np.percentile(err, 95))
         self.xnames = dataset.xnames
+        self.paramnames = dataset.paramnames
+        self.train_param_bounds = dict(min=Pmin.tolist(), max=Pmax.tolist())
 
         meta = dict(
             paramnames=dataset.paramnames,
@@ -1509,7 +1511,7 @@ class Emulator:
                     if hasattr(self.decoder, "get_config") else None
                 ),
             ),
-            train_param_bounds=dict(min=Pmin.tolist(), max=Pmax.tolist()),
+            train_param_bounds=self.train_param_bounds,
         )
         fit_stats = dict(
             fit_mean=self.fit_mean,
@@ -1527,7 +1529,6 @@ class Emulator:
         self._encoder = enc.to(self.device).double().eval()
         self._meta = meta
         self._loaded = True
-        self.paramnames = dataset.paramnames
 
         # Store architecture dimensions for save_latex_table()
         self._nin = nin
