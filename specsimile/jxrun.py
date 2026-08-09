@@ -92,6 +92,26 @@ def extract_pytorch_emulator_weights(model_path: str, verbose: bool = True) -> t
     
     return result, checkpoint
 
+def extract_pytorch_emulator_meta(model_path: str, verbose: bool = True) -> tuple:
+    """
+    Extract meta information from a specsimile Emulator saved as a PyTorch checkpoint.
+
+    Parameters
+    ----------
+    model_path : str
+        Path to the PyTorch .pt checkpoint file.
+    verbose : bool, optional
+        If True, print diagnostic information about the loaded checkpoint.
+        Default is True.
+
+    Returns
+    -------
+    meta : dict
+        Dictionary of meta information
+    """
+    _, checkpoint = extract_pytorch_emulator_weights(model_path, verbose=verbose)
+    return checkpoint['meta']
+
 def jax_encoder_forward(x: jnp.ndarray, bundle: dict, prefix: str) -> jnp.ndarray:
     """
     Forward pass through a specsimile encoder stored in *bundle* under *prefix*.
