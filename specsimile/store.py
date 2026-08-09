@@ -151,16 +151,17 @@ class DatasetWriter:
         self.num_data_training = 0
 
         self._f.create_dataset("x", data=x)
-        self._f.create_dataset("y", dtype=np.float64, shape=(N, len(x)))
+        self._num_x = len(x)
+        self._f.create_dataset("y", dtype=np.float64, shape=(N, self._num_x))
         self._f.create_dataset("params", dtype=np.float64, shape=(N, num_params))
 
         paramnames_b = _as_bytes_array(paramnames)
         self._f.create_dataset("paramnames", data=paramnames_b)
 
         if xnames is not None:
-            if len(xnames) != len(x):
+            if len(xnames) != self._num_x:
                 raise ValueError(
-                    f"xnames length {len(xnames)} must match x length {len(x)}"
+                    f"xnames length {len(xnames)} must match x length {self._num_x}"
                 )
             self._f.create_dataset("xnames", data=_as_bytes_array(xnames))
 
@@ -173,14 +174,18 @@ class DatasetWriter:
         self._f.attrs["yunit"] = _unit_to_string(yunit)
 
         self._f.flush()
+        self._x_ref = self._f["x"][()]
+        self._x_refshape = self._x_ref.shape
+        self._num_x = self._num_x
+        self._num_y = self._num_x
+        self._num_paramnames = len(paramnames)
 
     def _check_open(self) -> None:
         if self._f is None:
             raise RuntimeError("Writer is closed")
 
     def _check_x(self, x: np.ndarray) -> None:
-        x0 = self._f["x"][()]
-        if x.shape != x0.shape or not np.allclose(x, x0, rtol=0, atol=0):
+        if x.shape != self._x_refshape or not np.allclose(x, self._x_ref, rtol=0, atol=0):
             raise ValueError("x does not match stored x grid")
 
     def append(
@@ -206,42 +211,40 @@ class DatasetWriter:
         int
             The row index that was written.
         """
-        self._check_open()
-
-        x = np.asarray(x, dtype=np.float64)
-        y = np.asarray(y, dtype=np.float64)
-        params = np.asarray(params, dtype=np.float64)
-
-        if x.ndim != 1 or y.ndim != 1 or params.ndim != 1:
-            raise ValueError("x, y, params must be 1D arrays")
-
-        self._check_x(x)
-
-        if len(y) != self._f["y"].shape[1]:
-            raise ValueError(
-                f"y length mismatch: got {len(y)}, "
-                f"expected {self._f['y'].shape[1]}"
-            )
-        if len(params) != self._f["params"].shape[1]:
-            raise ValueError(
-                f"params length mismatch: got {len(params)}, "
-                f"expected {self._f['params'].shape[1]}"
-            )
-
-        i = int(self.num_data_training)
-        if i >= int(self.N):
+        i = self.num_data_training
+        if i >= self.N:
             raise RuntimeError(f"Training file already completely filled (N={self.N}).")
+
+        if i < 10 or i % 1000 == 0:
+            # for efficiency, check only initially, not for every single call
+            self._check_open()
+
+            if x.ndim != 1 or y.ndim != 1 or params.ndim != 1:
+                raise ValueError("x, y, params must be 1D arrays")
+
+            self._check_x(x)
+
+            if len(y) != self._num_y:
+                raise ValueError(
+                    f"y length mismatch: got {len(y)}, "
+                    f"expected {self._num_y}"
+                )
+            if len(params) != self._num_paramnames:
+                raise ValueError(
+                    f"params length mismatch: got {len(params)}, "
+                    f"expected {self._f['params'].shape[1]}"
+                )
 
         self._f["y"][i, :] = y
         self._f["params"][i, :] = params
 
         self.num_data_training += 1
-        self._f.attrs["num_data_training"] = int(self.num_data_training)
         if i == 1 or i == 10 or i == 100 or i == 1000 or i == 10000 or i == 100000 or i % 10_000_000 == 0:
+            self._f.attrs["num_data_training"] = self.num_data_training
             self._f.flush()
 
         # auto-close when full (keeps old behavior)
-        if self.num_data_training == self._f["y"].shape[0]:
+        if self.num_data_training == self.N:
             self.close()
 
         return i
