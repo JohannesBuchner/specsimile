@@ -188,6 +188,18 @@ def test_append_single_row():
     os.unlink(path)
 
 
+def test_append_single_nan_row():
+    path = make_tmp_path()
+    x = np.array([1.0, 2.0, 3.0])
+    with DatasetWriter(path, N=1, x=x, paramnames=["p1"]) as w:
+        with pytest.raises(ValueError):
+            w.append(x, np.array([np.nan, 20.0, 30.0]), np.array([0.5]))
+        with pytest.raises(ValueError):
+            w.append(x, np.array([10, 20.0, 30.0]), np.array([np.nan]))
+        with pytest.raises(ValueError):
+            w.append(x * np.nan, np.array([10, 20.0, 30.0]), np.array([0.5]))
+    os.unlink(path)
+
 def test_append_overflow_raises():
     path = make_tmp_path()
     x = np.array([1.0, 2.0])

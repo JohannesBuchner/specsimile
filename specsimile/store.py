@@ -234,6 +234,10 @@ class DatasetWriter:
                     f"params length mismatch: got {len(params)}, "
                     f"expected {self._f['params'].shape[1]}"
                 )
+            if not np.isfinite(params).all():
+                raise ValueError(f"params must be finite: {params}")
+            if not np.isfinite(y).all():
+                raise ValueError(f"y values must be finite: {y} [{y.min()}..{y.max()}]")
 
         self._f["y"][i, :] = y
         self._f["params"][i, :] = params
