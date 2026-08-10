@@ -441,8 +441,6 @@ class Emulator:
         func_floor_loss: float | None = None,
         loss_y_weights: np.ndarray | None = None,
         param_bounds_policy: str = 'error',
-        smooth_weight: float = 0.0,
-        smooth_frac: float = 1e-4,
         dropout: float = 0,
     ):
         """
@@ -479,14 +477,6 @@ class Emulator:
             How to handle out-of-bounds parameters at inference time.
             ``'error'`` raises ``ValueError``; ``'nan'`` returns NaN rows.
             Default is ``'error'``.
-        smooth_weight : float, optional
-            Weight λ of the finite-difference smoothness penalty relative to
-            the main RMS loss. ``0.0`` disables the penalty entirely.
-            Default is ``0.0``.
-        smooth_frac : float, optional
-            Step size as a fraction of the per-parameter training range
-            ``(hi - lo)``. Default ``1e-4`` means a step of 0.01 % of the
-            range.
         dropout : float, optional
             Dropout probability in the encoder. Default is ``0``.
         """
@@ -518,11 +508,6 @@ class Emulator:
         self.embed_dim = int(embed_dim)
         self.context_acti = context_acti
         self.dropout = dropout
-
-        self.smooth_weight = float(smooth_weight)
-        self.smooth_frac = float(smooth_frac)
-        # set during fit() once the parameter ranges are known
-        self._smooth_step: torch.Tensor | None = None
 
         # These are set after fit() or load() and used by save_latex_table()
         self._nin: int | None = None
@@ -709,43 +694,6 @@ class Emulator:
             Ypre = Y
         mean, std = self._y_mean_std(norm, Ypre.shape[1])
         return (Ypre - mean[None, :]) / std[None, :]
-
-    def _build_smooth_step(
-        self,
-        Pmin_inf: np.ndarray,
-        Pmax_inf: np.ndarray,
-        norm: dict,
-    ) -> torch.Tensor:
-        """Build per-parameter step sizes in *normalised* input space.
-
-        Parameters
-        ----------
-        Pmin_inf : np.ndarray
-            Physical minimum of the inference parameters only (context params
-            excluded). Shape ``(n_inf,)``.
-        Pmax_inf : np.ndarray
-            Physical maximum of the inference parameters only. Shape
-            ``(n_inf,)``.
-        norm : dict
-            Normalisation info from ``decoder.normalize()``.
-
-        Returns
-        -------
-        torch.Tensor
-            Step size for each inference parameter in normalised space, shape
-            ``(1, n_inf)``.
-        """
-        pn = norm["params"]
-        std_norm = np.asarray(pn["std"], dtype=np.float64)
-        n_inf = len(Pmin_inf)
-        std_norm_inf = std_norm[:n_inf]                        # inference params only
-
-        delta_phys = self.smooth_frac * (Pmax_inf - Pmin_inf) # physical step
-        delta_norm = delta_phys / np.clip(std_norm_inf, 1e-30, None)  # normalised step
-
-        return torch.tensor(
-            delta_norm.reshape(1, -1), dtype=torch.float64, device=self.device
-        )
 
     # ---------- checkpoint IO ----------
 
@@ -1261,11 +1209,6 @@ class Emulator:
         T = self._target_y_pre(Y, norm_info)
         print("emulator architecture:", self._arch_string(x, P, Y))
 
-        if self.smooth_weight > 0.0:
-            print(
-                f"Smoothness penalty (gradient/JVP): weight={self.smooth_weight}"
-            )
-
         n = len(dataset)
         torch.manual_seed(seed)
         if torch.cuda.is_available():
@@ -1322,15 +1265,6 @@ class Emulator:
         y_std = torch.tensor(
             y_std_np.reshape(1, -1), dtype=dtype, device=self.device
         )
-        if self.smooth_weight > 0.0:
-            n_inf = P.shape[1] - self.n_context_params
-            # prepare random directions in R^P, uniform on the unit ball,
-            # then scale each component by the per-parameter step size
-            # --- Build perturbation in inference-param space only ---
-            self._smooth_step = self._build_smooth_step(
-                Pmin[:n_inf], Pmax[:n_inf], norm_info
-            )
-
         # --- Epoch-0 floor mask: skip samples whose targets are entirely below floor ---
         # A sample is below the floor when max(T[i]) <= floor[i],
         # i.e. the entire output is at or below the dynamic-range floor.
@@ -1369,11 +1303,6 @@ class Emulator:
                 active_len = len(Xtr)
                 perm_base = None
             perm = rng.permutation(len(Xtr))
-            if self.smooth_weight > 0.0:
-                rand_normal = torch.randn(len(Xtr), n_inf, dtype=Xtr.dtype, device=Xtr.device)
-                rand_normal = rand_normal / (rand_normal.norm(dim=1, keepdim=True) + 1e-30)
-                rand_normal_va = torch.randn(len(Xva), n_inf, dtype=Xva.dtype, device=Xva.device)
-                rand_normal_va = rand_normal_va / (rand_normal_va.norm(dim=1, keepdim=True) + 1e-30)
             for i0 in range(0, active_len, batch_size):
                 if perm_base is not None:
                     sl = perm_base[i0: i0 + batch_size]
@@ -1387,25 +1316,7 @@ class Emulator:
                 y_pre = dec(z_phys)
                 y_hat = (y_pre - y_mean) / y_std
 
-                main_loss = self.loss_fn(y_hat, tb) ** 2
-
-                if self.smooth_weight > 0.0:
-                    if True:
-                        smooth_loss = self._taylor_consistency_penalty(
-                            xb, enc, dec, lat_mean, lat_std, y_mean, y_std,
-                            # instead of sl, we intentionally use i0, to have linearly increasing memory access
-                            # the numbers are random anyway.
-                            direction=rand_normal[i0: i0 + batch_size],
-                            create_graph=True,  # differentiable
-                        )
-                    else:
-                        smooth_loss = self._gradient_magnitude_penalty(
-                            xb, enc, dec, lat_mean, lat_std, y_mean, y_std,
-                            create_graph=True,
-                        )
-                    loss = main_loss + self.smooth_weight * smooth_loss
-                else:
-                    loss = main_loss
+                loss = self.loss_fn(y_hat, tb) ** 2
 
                 opt.zero_grad()
                 loss.backward()
@@ -1425,32 +1336,8 @@ class Emulator:
                 val_rmse = val_rms_per_sample.mean().item()
                 val_p95 = float(torch.quantile(val_rms_per_sample, 0.95).item())
 
-            if self.smooth_weight > 0.0:
-                # No torch.no_grad() here: _taylor_consistency_penalty needs
-                # autograd.grad for f(x), even with create_graph=False.
-                # But enc should remain in eval() mode.
-                
-                # Sample a subset to keep validation fast
-                if True:
-                    vsmooth = self._taylor_consistency_penalty(
-                        Xva, enc, dec, lat_mean, lat_std, y_mean, y_std,
-                        direction=rand_normal_va,
-                        create_graph=False,  # not differentiable
-                    ).item()
-                else:
-                    vsmooth = self._gradient_magnitude_penalty(
-                        Xva, enc, dec, lat_mean, lat_std, y_mean, y_std,
-                        create_graph=False,
-                    ).item()
-                vtotal = vloss + self.smooth_weight * vsmooth
-                loss_str = (
-                    f"MSE={vloss:.3f}  RMSE={val_rmse:.3f} (95%={val_p95:.3f})  "
-                    f"+smooth={vsmooth:.3f} * {self.smooth_weight} -> "
-                    f"{vtotal:.3f}"
-                )
-            else:
-                vtotal = vloss
-                loss_str = f"MSE={vloss:.3f}  RMSE={val_rmse:.3f} (95%={val_p95:.3f})"
+            vtotal = vloss
+            loss_str = f"MSE={vloss:.3f}  RMSE={val_rmse:.3f} (95%={val_p95:.3f})"
 
             if vtotal < best - patience_min_loss_difference:
                 best = vtotal
