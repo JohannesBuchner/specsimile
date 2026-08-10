@@ -20,7 +20,8 @@ except IOError:
     with open(os.path.join(os.path.dirname(__file__), 'HISTORY.rst')) as history_file:
         history = history_file.read()
 
-requirements = ['oldest-supported-numpy', 'emcee', 'arviz']
+requirements = [l.strip() for l in open(os.path.join(os.path.dirname(__file__), 'pip-requirements.txt'))]
+#['oldest-supported-numpy', 'emcee', 'arviz']
 
 setup_requirements = ['pytest-runner', ]
 

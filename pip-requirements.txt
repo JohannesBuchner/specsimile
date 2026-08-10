@@ -1,4 +1,6 @@
 oldest-supported-numpy
 torch
 h5py
+jaxlib
+jax
 matplotlib
