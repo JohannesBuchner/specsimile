@@ -253,6 +253,95 @@ class DatasetWriter:
 
         return i
 
+    def append_chunk(
+        self,
+        x: Union[np.ndarray, List[float]],
+        y: Union[np.ndarray, List[List[float]]],
+        params: Union[np.ndarray, List[List[float]]],
+    ) -> slice:
+        """
+        Write multiple rows at once, equivalent to calling .append many times
+        but more efficient through vectorized HDF5 writes.
+
+        Parameters
+        ----------
+        x : array_like of shape (X,)
+            The x-axis grid; must match the stored x grid exactly.
+        y : array_like of shape (M, Y)
+            The y values for each row in the chunk.
+        params : array_like of shape (M, P)
+            The parameter values for each row in the chunk.
+
+        Returns
+        -------
+        slice
+            The slice of row indices that were written, i.e. ``slice(i0, i0 + M)``.
+
+        Raises
+        ------
+        RuntimeError
+            If the writer is closed or there is insufficient space.
+        ValueError
+            If shapes are inconsistent or values are non-finite.
+        """
+        self._check_open()
+
+        x = np.asarray(x, dtype=np.float64)
+        y = np.asarray(y, dtype=np.float64)
+        params = np.asarray(params, dtype=np.float64)
+
+        if x.ndim != 1:
+            raise ValueError(f"x must be 1D, got shape {x.shape}")
+        if y.ndim != 2:
+            raise ValueError(f"y must be 2D (M, Y), got shape {y.shape}")
+        if params.ndim != 2:
+            raise ValueError(f"params must be 2D (M, P), got shape {params.shape}")
+
+        n_rows = y.shape[0]
+        if params.shape[0] != n_rows:
+            raise ValueError(
+                f"y and params must have the same number of rows, "
+                f"got y={y.shape}, params={params.shape}"
+            )
+
+        self._check_x(x)
+
+        if y.shape[1] != self._num_y:
+            raise ValueError(
+                f"y column count mismatch: got {y.shape[1]}, "
+                f"expected {self._num_y}"
+            )
+        if params.shape[1] != self._num_paramnames:
+            raise ValueError(
+                f"params column count mismatch: got {params.shape[1]}, "
+                f"expected {self._num_paramnames}"
+            )
+
+        if not np.isfinite(params).all():
+            raise ValueError("params must be finite")
+        if not np.isfinite(y).all():
+            raise ValueError(f"y values must be finite: [{y.min()}..{y.max()}]")
+
+        i0 = int(self.num_data_training)
+        i1 = i0 + n_rows
+        if i1 > int(self.N):
+            raise RuntimeError(
+                f"Not enough space: trying to write rows {i0}..{i1-1} "
+                f"but dataset capacity is N={self.N}."
+            )
+
+        self._f["y"][i0:i1, :] = y
+        self._f["params"][i0:i1, :] = params
+
+        self.num_data_training += n_rows
+        self._f.attrs["num_data_training"] = int(self.num_data_training)
+        self._f.flush()
+
+        if self.num_data_training == self.N:
+            self.close()
+
+        return slice(i0, i1)
+
     def set(
         self,
         x: Union[np.ndarray, List[float]],

@@ -497,3 +497,408 @@ def test_roundtrip_x_values(values):
     finally:
         if os.path.exists(path):
             os.unlink(path)
+
+
+# ---------------------------------------------------------------------------
+# append_chunk equivalence to append
+# ---------------------------------------------------------------------------
+
+def test_append_chunk_single_row_equivalent_to_append():
+    """append_chunk with one row should produce identical results to append."""
+    x = np.array([1.0, 2.0, 3.0])
+    y_row = np.array([10.0, 20.0, 30.0])
+    p_row = np.array([0.5, 1.5])
+
+    path_append = make_tmp_path()
+    path_chunk = make_tmp_path()
+
+    try:
+        with DatasetWriter(path_append, N=1, x=x, paramnames=["p1", "p2"]) as w:
+            w.append(x, y_row, p_row)
+
+        with DatasetWriter(path_chunk, N=1, x=x, paramnames=["p1", "p2"]) as w:
+            w.append_chunk(x, y_row[np.newaxis, :], p_row[np.newaxis, :])
+
+        r_append = DatasetReader(path_append)
+        r_chunk = DatasetReader(path_chunk)
+        np.testing.assert_allclose(r_chunk.y, r_append.y)
+        np.testing.assert_allclose(r_chunk.params, r_append.params)
+        np.testing.assert_allclose(r_chunk.x, r_append.x)
+        r_append.close()
+        r_chunk.close()
+    finally:
+        for p in (path_append, path_chunk):
+            if os.path.exists(p):
+                os.unlink(p)
+
+
+def test_append_chunk_multiple_rows_equivalent_to_append():
+    """append_chunk with multiple rows should match row-by-row append."""
+    rng = np.random.default_rng(7)
+    x = np.linspace(0, 1, 8)
+    n = 5
+    plen = 3
+    y = rng.random((n, len(x)))
+    params = rng.random((n, plen))
+    paramnames = ["a", "b", "c"]
+
+    path_append = make_tmp_path()
+    path_chunk = make_tmp_path()
+
+    try:
+        with DatasetWriter(path_append, N=n, x=x, paramnames=paramnames) as w:
+            for i in range(n):
+                w.append(x, y[i], params[i])
+
+        with DatasetWriter(path_chunk, N=n, x=x, paramnames=paramnames) as w:
+            w.append_chunk(x, y, params)
+
+        r_append = DatasetReader(path_append)
+        r_chunk = DatasetReader(path_chunk)
+        np.testing.assert_allclose(r_chunk.y, r_append.y)
+        np.testing.assert_allclose(r_chunk.params, r_append.params)
+        assert len(r_chunk) == len(r_append) == n
+        r_append.close()
+        r_chunk.close()
+    finally:
+        for p in (path_append, path_chunk):
+            if os.path.exists(p):
+                os.unlink(p)
+
+
+def test_append_chunk_returns_correct_slice():
+    """append_chunk should return the correct slice of written rows."""
+    x = np.array([0.0, 1.0, 2.0])
+    y = np.ones((4, 3))
+    params = np.zeros((4, 2))
+
+    path = make_tmp_path()
+    try:
+        with DatasetWriter(path, N=4, x=x, paramnames=["p1", "p2"]) as w:
+            sl = w.append_chunk(x, y, params)
+        assert sl == slice(0, 4)
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
+
+
+def test_append_chunk_incremental_slices():
+    """Multiple append_chunk calls should return consecutive slices."""
+    x = np.array([1.0, 2.0])
+    y1 = np.array([[1.0, 2.0], [3.0, 4.0]])
+    p1 = np.array([[0.1, 0.2], [0.3, 0.4]])
+    y2 = np.array([[5.0, 6.0], [7.0, 8.0], [9.0, 10.0]])
+    p2 = np.array([[0.5, 0.6], [0.7, 0.8], [0.9, 1.0]])
+
+    path = make_tmp_path()
+    try:
+        with DatasetWriter(path, N=5, x=x, paramnames=["p1", "p2"]) as w:
+            sl1 = w.append_chunk(x, y1, p1)
+            sl2 = w.append_chunk(x, y2, p2)
+        assert sl1 == slice(0, 2)
+        assert sl2 == slice(2, 5)
+
+        r = DatasetReader(path)
+        np.testing.assert_allclose(r.y[:2], y1)
+        np.testing.assert_allclose(r.y[2:], y2)
+        np.testing.assert_allclose(r.params[:2], p1)
+        np.testing.assert_allclose(r.params[2:], p2)
+        r.close()
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
+
+
+def test_append_chunk_and_append_interleaved():
+    """Interleaving append_chunk and append should produce correct results."""
+    x = np.array([1.0, 2.0, 3.0])
+    paramnames = ["q"]
+
+    y_chunk = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    p_chunk = np.array([[0.1], [0.2]])
+    y_single = np.array([7.0, 8.0, 9.0])
+    p_single = np.array([0.3])
+
+    path_interleaved = make_tmp_path()
+    path_append_only = make_tmp_path()
+
+    try:
+        with DatasetWriter(path_interleaved, N=3, x=x, paramnames=paramnames) as w:
+            w.append_chunk(x, y_chunk, p_chunk)
+            w.append(x, y_single, p_single)
+
+        with DatasetWriter(path_append_only, N=3, x=x, paramnames=paramnames) as w:
+            w.append(x, y_chunk[0], p_chunk[0])
+            w.append(x, y_chunk[1], p_chunk[1])
+            w.append(x, y_single, p_single)
+
+        r_i = DatasetReader(path_interleaved)
+        r_a = DatasetReader(path_append_only)
+        np.testing.assert_allclose(r_i.y, r_a.y)
+        np.testing.assert_allclose(r_i.params, r_a.params)
+        r_i.close()
+        r_a.close()
+    finally:
+        for p in (path_interleaved, path_append_only):
+            if os.path.exists(p):
+                os.unlink(p)
+
+
+def test_append_chunk_num_data_training_updated():
+    """num_data_training should be correctly updated after append_chunk."""
+    x = np.array([0.0, 1.0])
+    y = np.ones((3, 2))
+    params = np.zeros((3, 1))
+
+    path = make_tmp_path()
+    try:
+        w = DatasetWriter(path, N=5, x=x, paramnames=["p"])
+        assert w.num_data_training == 0
+        w.append_chunk(x, y, params)
+        assert w.num_data_training == 3
+        w.append_chunk(x, y[:2], params[:2])
+        assert w.num_data_training == 5
+        w.close()
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
+
+
+def test_append_chunk_overflow_raises():
+    """append_chunk should raise RuntimeError when chunk exceeds capacity."""
+    x = np.array([1.0, 2.0])
+    y = np.ones((5, 2))
+    params = np.zeros((5, 1))
+
+    path = make_tmp_path()
+    try:
+        w = DatasetWriter(path, N=3, x=x, paramnames=["p"])
+        with pytest.raises(RuntimeError):
+            w.append_chunk(x, y, params)
+        w.close()
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
+
+
+def test_append_chunk_wrong_x_raises():
+    """append_chunk should raise ValueError when x does not match stored grid."""
+    x = np.array([1.0, 2.0, 3.0])
+    wrong_x = np.array([1.0, 2.0, 4.0])
+    y = np.ones((2, 3))
+    params = np.zeros((2, 1))
+
+    path = make_tmp_path()
+    try:
+        w = DatasetWriter(path, N=2, x=x, paramnames=["p"])
+        with pytest.raises(ValueError):
+            w.append_chunk(wrong_x, y, params)
+        w.close()
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
+
+
+def test_append_chunk_wrong_y_columns_raises():
+    """append_chunk should raise ValueError when y has wrong number of columns."""
+    x = np.array([1.0, 2.0, 3.0])
+    y = np.ones((2, 2))  # should be (2, 3)
+    params = np.zeros((2, 1))
+
+    path = make_tmp_path()
+    try:
+        w = DatasetWriter(path, N=2, x=x, paramnames=["p"])
+        with pytest.raises(ValueError):
+            w.append_chunk(x, y, params)
+        w.close()
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
+
+
+def test_append_chunk_wrong_params_columns_raises():
+    """append_chunk should raise ValueError when params has wrong number of columns."""
+    x = np.array([1.0, 2.0])
+    y = np.ones((2, 2))
+    params = np.zeros((2, 3))  # should be (2, 1)
+
+    path = make_tmp_path()
+    try:
+        w = DatasetWriter(path, N=2, x=x, paramnames=["p"])
+        with pytest.raises(ValueError):
+            w.append_chunk(x, y, params)
+        w.close()
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
+
+
+def test_append_chunk_nan_y_raises():
+    """append_chunk should raise ValueError when y contains NaN."""
+    x = np.array([1.0, 2.0])
+    y = np.array([[1.0, np.nan], [2.0, 3.0]])
+    params = np.zeros((2, 1))
+
+    path = make_tmp_path()
+    try:
+        w = DatasetWriter(path, N=2, x=x, paramnames=["p"])
+        with pytest.raises(ValueError):
+            w.append_chunk(x, y, params)
+        w.close()
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
+
+
+def test_append_chunk_nan_params_raises():
+    """append_chunk should raise ValueError when params contains NaN."""
+    x = np.array([1.0, 2.0])
+    y = np.ones((2, 2))
+    params = np.array([[np.nan], [0.5]])
+
+    path = make_tmp_path()
+    try:
+        w = DatasetWriter(path, N=2, x=x, paramnames=["p"])
+        with pytest.raises(ValueError):
+            w.append_chunk(x, y, params)
+        w.close()
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
+
+
+def test_append_chunk_row_mismatch_raises():
+    """append_chunk should raise ValueError when y and params have different row counts."""
+    x = np.array([1.0, 2.0])
+    y = np.ones((3, 2))
+    params = np.zeros((2, 1))
+
+    path = make_tmp_path()
+    try:
+        w = DatasetWriter(path, N=3, x=x, paramnames=["p"])
+        with pytest.raises(ValueError):
+            w.append_chunk(x, y, params)
+        w.close()
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
+
+
+def test_append_chunk_1d_y_raises():
+    """append_chunk should raise ValueError when y is 1D instead of 2D."""
+    x = np.array([1.0, 2.0])
+    y = np.ones(2)  # 1D, should be 2D
+    params = np.zeros((1, 1))
+
+    path = make_tmp_path()
+    try:
+        w = DatasetWriter(path, N=1, x=x, paramnames=["p"])
+        with pytest.raises(ValueError):
+            w.append_chunk(x, y, params)
+        w.close()
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
+
+
+def test_append_chunk_1d_params_raises():
+    """append_chunk should raise ValueError when params is 1D instead of 2D."""
+    x = np.array([1.0, 2.0])
+    y = np.ones((1, 2))
+    params = np.zeros(1)  # 1D, should be 2D
+
+    path = make_tmp_path()
+    try:
+        w = DatasetWriter(path, N=1, x=x, paramnames=["p"])
+        with pytest.raises(ValueError):
+            w.append_chunk(x, y, params)
+        w.close()
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
+
+
+@given(
+    n=st.integers(min_value=1, max_value=10),
+    xlen=st.integers(min_value=1, max_value=8),
+    plen=st.integers(min_value=1, max_value=4),
+)
+@settings(max_examples=30, deadline=None)
+def test_append_chunk_equivalent_to_append_hypothesis(n, xlen, plen):
+    """Property: append_chunk and row-by-row append always produce identical files."""
+    rng = np.random.default_rng(n * 1000 + xlen * 100 + plen)
+    x = np.sort(rng.random(xlen))
+    y = rng.random((n, xlen))
+    params = rng.random((n, plen))
+    paramnames = [f"p{i}" for i in range(plen)]
+
+    path_append = make_tmp_path()
+    path_chunk = make_tmp_path()
+
+    try:
+        with DatasetWriter(path_append, N=n, x=x, paramnames=paramnames) as w:
+            for i in range(n):
+                w.append(x, y[i], params[i])
+
+        with DatasetWriter(path_chunk, N=n, x=x, paramnames=paramnames) as w:
+            w.append_chunk(x, y, params)
+
+        r_append = DatasetReader(path_append)
+        r_chunk = DatasetReader(path_chunk)
+
+        np.testing.assert_allclose(r_chunk.x, r_append.x)
+        np.testing.assert_allclose(r_chunk.y, r_append.y)
+        np.testing.assert_allclose(r_chunk.params, r_append.params)
+        assert len(r_chunk) == len(r_append) == n
+
+        r_append.close()
+        r_chunk.close()
+    finally:
+        for p in (path_append, path_chunk):
+            if os.path.exists(p):
+                os.unlink(p)
+
+
+@given(
+    chunk_sizes=st.lists(st.integers(min_value=1, max_value=5), min_size=1, max_size=5),
+    xlen=st.integers(min_value=1, max_value=6),
+    plen=st.integers(min_value=1, max_value=3),
+)
+@settings(max_examples=20, deadline=None)
+def test_append_chunk_multiple_chunks_equivalent_to_append_hypothesis(chunk_sizes, xlen, plen):
+    """Property: multiple append_chunk calls equal the same rows written with append."""
+    rng = np.random.default_rng(sum(chunk_sizes) + xlen * 17 + plen * 31)
+    n = sum(chunk_sizes)
+    x = np.sort(rng.random(xlen))
+    y = rng.random((n, xlen))
+    params = rng.random((n, plen))
+    paramnames = [f"q{i}" for i in range(plen)]
+
+    path_append = make_tmp_path()
+    path_chunk = make_tmp_path()
+
+    try:
+        with DatasetWriter(path_append, N=n, x=x, paramnames=paramnames) as w:
+            for i in range(n):
+                w.append(x, y[i], params[i])
+
+        with DatasetWriter(path_chunk, N=n, x=x, paramnames=paramnames) as w:
+            offset = 0
+            for size in chunk_sizes:
+                w.append_chunk(x, y[offset:offset + size], params[offset:offset + size])
+                offset += size
+
+        r_append = DatasetReader(path_append)
+        r_chunk = DatasetReader(path_chunk)
+
+        np.testing.assert_allclose(r_chunk.x, r_append.x)
+        np.testing.assert_allclose(r_chunk.y, r_append.y)
+        np.testing.assert_allclose(r_chunk.params, r_append.params)
+        assert len(r_chunk) == len(r_append) == n
+
+        r_append.close()
+        r_chunk.close()
+    finally:
+        for p in (path_append, path_chunk):
+            if os.path.exists(p):
+                os.unlink(p)
