@@ -1,4 +1,4 @@
-oldest-supported-numpy
+numpy
 torch
 h5py
 matplotlib
