@@ -4,3 +4,4 @@ h5py
 jaxlib
 jax
 matplotlib
+astropy

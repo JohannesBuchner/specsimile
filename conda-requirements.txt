@@ -2,3 +2,5 @@ numpy
 pytorch
 h5py
 matplotlib
+astropy
+jax
