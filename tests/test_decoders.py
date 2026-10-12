@@ -49,10 +49,9 @@ def test_sigmoid_asinh_shape():
 def test_sigmoid_asinh_in_range(v, lo, hi):
     x = torch.tensor([v], dtype=torch.float64)
     result = sigmoid_asinh(x, lo, hi).item()
-    mid = (lo + hi) / 2.0
-    spread = hi - lo
     # result must be strictly between lo-margin and hi+margin (unbounded asinh)
-    # but centered around mid; just verify finite and symmetric about mid
+    # but centered around the middle of lo and hi; just verify finite and
+    # symmetric about the middle
     assert np.isfinite(result)
 
 

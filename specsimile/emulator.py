@@ -380,21 +380,17 @@ def _build_latex_table(
         lines.append(r"\hline")
 
         lines.append(r"\multicolumn{3}{l}{\textit{Context encoder}} \\")
-        prev = n_context_params
         for width in shape[:1]:
             lines.append(f"Linear layer & {width} & {context_acti} \\\\")
-            prev = width
         lines.append(f"Linear layer (embedding) & {embed_dim} & -- \\\\")
         lines.append(r"\hline")
 
         lines.append(r"\multicolumn{3}{l}{\textit{Main encoder}} \\")
         lines.append(f"Concatenated input (inference + embedding) & {n_inference + embed_dim} & -- \\\\")
-        prev = n_inference + embed_dim
         for width in shape:
             lines.append(f"Linear layer & {width} & {acti} \\\\")
             if dropout > 0.0:
                 lines.append(f"Dropout & {width} & $p={dropout}$ \\\\")
-            prev = width
         lines.append(f"Linear layer (latent) & {latent_dim} & -- \\\\")
     else:
         lines.append(r"\multicolumn{3}{l}{\textit{Input}} \\")
@@ -402,12 +398,10 @@ def _build_latex_table(
         lines.append(r"\hline")
 
         lines.append(r"\multicolumn{3}{l}{\textit{Encoder}} \\")
-        prev = nin
         for width in shape:
             lines.append(f"Linear layer & {width} & {acti} \\\\")
             if dropout > 0.0:
                 lines.append(f"Dropout & {width} & $p={dropout}$ \\\\")
-            prev = width
         lines.append(f"Linear layer (latent) & {latent_dim} & -- \\\\")
 
     lines.append(r"\hline")
@@ -1296,7 +1290,9 @@ class Emulator:
                 active_len = len(ep0_tr_idx)
                 perm_base = ep0_tr_idx[rng.permutation(active_len)]
                 if active_len == 0:
-                    raise AssertionError(f"All training samples are below the adopted loss floor (static={self.func_floor_loss}, dynamic={self.dynamic_range}).")
+                    raise AssertionError(
+                        f"All training samples are below the adopted loss floor "
+                        f"(static={self.func_floor_loss}, dynamic={self.dynamic_range}).")
                 if active_len != len(Xtr):
                     print(f"Warmup using {active_len}/{len(Xtr)} samples above floor")
             else:

@@ -58,8 +58,9 @@ clean-doc:
 	rm -rf docs/build
 	#nbstripout docs/*.ipynb
 
-lint: ## check style with flake8
+lint: ## check style with flake8 and pycodestyle
 	flake8 specsimile tests
+	pycodestyle specsimile tests
 
 test: ## run tests quickly with the default Python
 	PYTHONPATH=. pytest

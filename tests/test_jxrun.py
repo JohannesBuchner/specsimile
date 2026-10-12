@@ -187,9 +187,8 @@ def test_cutoffpl_emulator_vs_jxrun():
         # --- Path 2: jxrun ---
         bundle = jxrun.load_decoder_bundle(model_path, prefix="test", verbose=False)
 
-        # Normalise inputs using the stored norm
-        norm = bundle["test_norm"] if "test_norm" in bundle else None
-        # The norm is embedded in the bundle; jax_encoder_forward handles it.
+        # Inputs are normalised by jax_encoder_forward using the norm
+        # embedded in the bundle.
         x_jax = jnp.array(fiducial_params, dtype=jnp.float64)  # (1, 3)
         z_phys_jax = jxrun.jax_encoder_forward(x_jax, bundle, prefix="test")
         # z_phys_jax has shape (1, latent_dim=3): [logA_raw, gamma_raw, logxcut_raw]
@@ -462,7 +461,6 @@ def test_inside_param_bounds_consistent_with_verify_bundle_param_bounds():
         #  - some clearly inside the training range
         #  - some clearly outside (below min or above max for each dimension)
         n_inside = 5
-        n_outside = 6
 
         inside_params = np.column_stack([
             rng.uniform(pmin[0], pmax[0], size=n_inside),
