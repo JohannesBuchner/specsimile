@@ -224,7 +224,10 @@ def test_cutoffpl_evaluate_positive():
 
 def test_cutoffpl_latent_to_params_gamma_in_range():
     dec = CutoffPLDecoder(gamma_lo=0.5, gamma_hi=6.0)
-    z = torch.randn(100, 3, dtype=torch.float64)
+    # sigmoid_asinh has unbounded tails, so an unseeded torch.randn draw can
+    # decode outside the bounds; sweep the typical latent range instead.
+    z = torch.zeros(100, 3, dtype=torch.float64)
+    z[:, 1] = torch.linspace(-3.5, 3.5, 100)
     _, gamma, _ = dec.latent_to_params(z)
     assert torch.all(gamma > 0.5) and torch.all(gamma < 6.0)
 
@@ -302,7 +305,10 @@ def test_sbpl_latent_to_params_shapes():
 
 def test_sbpl_xbrk_in_range():
     dec = SBPLDecoder(logx_lo=0.0, logx_hi=3.0)
-    z = torch.randn(100, 5, dtype=torch.float64)
+    # sigmoid_asinh has unbounded tails, so an unseeded torch.randn draw can
+    # decode outside the bounds; sweep the typical latent range instead.
+    z = torch.zeros(100, 5, dtype=torch.float64)
+    z[:, 3] = torch.linspace(-3.5, 3.5, 100)
     _, _, _, xbrk, _ = dec.latent_to_params(z)
     assert torch.all(xbrk > 1.0) and torch.all(xbrk < 1000.0)
 
@@ -386,7 +392,10 @@ def test_quadratic_evaluate_positive():
 
 def test_quadratic_latent_to_params_xpeak_in_range():
     dec = QuadraticDecoder(logx_lo=0.0, logx_hi=3.0)
-    z = torch.randn(100, 3, dtype=torch.float64)
+    # sigmoid_asinh has unbounded tails, so an unseeded torch.randn draw can
+    # decode outside the bounds; sweep the typical latent range instead.
+    z = torch.zeros(100, 3, dtype=torch.float64)
+    z[:, 1] = torch.linspace(-3.5, 3.5, 100)
     _, xpeak, _ = dec.latent_to_params(z)
     log_xpeak = torch.log10(xpeak)
     assert torch.all(log_xpeak > 0.0) and torch.all(log_xpeak < 3.0)
